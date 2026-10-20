@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: NinjaTrader and TradingView versions
+    url: https://github.com/tatankatrading/tatanka-indicators
+    about: Questions or bugs about the NinjaTrader 8 or TradingView indicators go to the main repo.
+  - name: Tatanka Trading
+    url: https://tatankatrading.com
+    about: Everything else.

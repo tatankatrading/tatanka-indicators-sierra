@@ -1,0 +1,83 @@
+name: Bug report
+description: Something in a Tatanka Sierra Chart study looks wrong, is slow, or won't build.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! These studies are in beta, so every report helps.
+        **Never paste a Discord webhook URL** here or show one in a screenshot. Anyone who has it can post to your channel.
+  - type: dropdown
+    id: study
+    attributes:
+      label: Which study?
+      options:
+        - AMT Toolkit
+        - TPO Profile
+        - If/Then
+        - 1hr 21 EMA
+        - Gap Analysis
+        - Level Lines
+        - Session Volume Profile
+        - Periodic Volume Profile
+        - Auto Anchored Volume Profile
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, what you saw instead, and the steps to get there.
+    validations:
+      required: true
+  - type: input
+    id: chart
+    attributes:
+      label: Symbol and bar period
+      placeholder: "ESZ6, 5 minute, Days to Load 60"
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings you changed
+      description: Any study inputs or subgraph settings you changed from the defaults.
+  - type: input
+    id: version
+    attributes:
+      label: Sierra Chart version
+      description: Help → About
+      placeholder: "2691"
+    validations:
+      required: true
+  - type: input
+    id: scale
+    attributes:
+      label: Windows display scale
+      placeholder: "150%"
+  - type: dropdown
+    id: opengl
+    attributes:
+      label: OpenGL (Global Settings → Graphics Settings)
+      options:
+        - "On"
+        - "Off"
+        - Not sure
+  - type: input
+    id: storage
+    attributes:
+      label: Intraday Data Storage Time Unit
+      description: Global Settings → Data/Trade Service Settings
+      placeholder: "1 Tick"
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag images here. Zoomed-in crops are best. Cover any webhook URL.
+  - type: textarea
+    id: log
+    attributes:
+      label: Message Log or build output
+      description: Anything red in Window → Message Log, or, for a build failure, all the text in the Output area of the Build Custom Studies DLL window. Remove any webhook URL first.
+      render: text
