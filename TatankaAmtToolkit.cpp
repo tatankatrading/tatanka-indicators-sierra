@@ -8612,6 +8612,9 @@ namespace
 		g.DrawZeros			= 0;
 		g.LineLabel			= tag ? LL_DISPLAY_VALUE | LL_VALUE_ALIGN_VALUES_SCALE | LL_VALUE_ALIGN_CENTER : 0;
 		g.DisplayNameValueInWindowsFlags = 0;
+		// Sierra shows every subgraph on the Region Data Line by default; most of these hold 0 (they
+		// carry line settings, not values), so "PIVOT: 0.00 RES: 0.00 ..." would fill the line.
+		g.DisplayNameValueInDataLine = 0;
 		g.UseLabelsColor	= 0;
 		g.SecondaryColorUsed = 0;
 	}
