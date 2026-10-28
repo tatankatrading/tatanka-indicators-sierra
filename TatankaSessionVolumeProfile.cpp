@@ -180,8 +180,9 @@ namespace
 		return x >= 0 ? RoundHalfUp(x) : -RoundHalfUp(-x);
 	}
 
-	// Sierra's tick size is a float (0.01f is 0.0099999998). This is the decimal tick it stands for.
-	double DecimalTickSize(float tickSize)
+	// Sierra's tick size is a float in older versions (0.01f is 0.0099999998) and a double in newer
+	// ones. This is the decimal tick it stands for.
+	double DecimalTickSize(double tickSize)
 	{
 		if (!(tickSize > 0))
 			return 0;

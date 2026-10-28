@@ -407,8 +407,9 @@ namespace
 		return b;
 	}
 
-	// Sierra's tick size is a float (0.01f is 0.0099999998). This is the decimal tick it stands for.
-	double DecimalTickSize(float tickSize)
+	// Sierra's tick size is a float in older versions (0.01f is 0.0099999998) and a double in newer
+	// ones. This is the decimal tick it stands for.
+	double DecimalTickSize(double tickSize)
 	{
 		if (!(tickSize > 0))
 			return 0;
@@ -6599,7 +6600,8 @@ namespace
 				signature = Fnv1a(signature, &date, sizeof(date));
 				if (i == count - 2)
 				{
-					const float bar[3] = {daily[SC_HIGH][i], daily[SC_LOW][i], daily[SC_LAST][i]};
+					const float bar[3] = {static_cast<float>(daily[SC_HIGH][i]), static_cast<float>(daily[SC_LOW][i]),
+						static_cast<float>(daily[SC_LAST][i])};
 					signature = Fnv1a(signature, bar, sizeof(bar));
 				}
 			}
