@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tatanka Trading LLC.
 // This Source Code Form is subject to the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, obtain one at https://mozilla.org/MPL/2.0/.
-// Tatanka Level Lines v1.0.0 for Sierra Chart - tatankatrading.com
+// Tatanka Level Lines v1.1.1 for Sierra Chart - tatankatrading.com
 
 // TatankaLevelLines
 // Labeled horizontal levels for Sierra Chart:
@@ -13,15 +13,26 @@
 //      Styles: Solid, Dash, Dot, DashDot, DashDotDot.
 // Labels sit on the right edge above each line, with the price appended, and stack
 // instead of overlapping when two lines are close.
+//   3. Optional sharing: one chart set to Source, others set to Follow draw its lines.
+//      Charts share within one contract month; a micro shares with its full-size
+//      contract (MES with ES, MNQ with NQ, ...).
 //
 // Line colors, styles and widths are on the Subgraphs tab. Lines and labels are drawn
 // in a drawing callback, so they never stretch the price scale. The range shading is
 // a transparent Rectangle Highlight drawing, since the callback can't draw transparency.
+//
+// Sharing (NinjaTrader 1.1.0) keeps each Source's levels in this DLL's memory, which every
+// chart of one Sierra Chart instance shares, in every open chartbook: NinjaTrader keeps them
+// in its own process the same way. See LevelStore for how it works and its limits.
 
 #include "sierrachart.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,7 +44,12 @@ namespace
 	// Persistent variable keys
 	const int PI_SHADE_LINE		= 1;
 	const int PI_EDIT_MENU_ID	= 2;
+	const int PI_SHADE_COLOR	= 3;	// the range shading as last drawn
+	const int PI_SHADE_OPACITY	= 4;
+	const int PD_SHADE_TOP		= 1;
+	const int PD_SHADE_BOTTOM	= 2;
 	const int PP_EDITOR			= 1;
+	const int PI64_OWNER_TOKEN	= 1;	// this instance's number as a Source (OwnerOf)
 
 	const char* const EDIT_MENU_TEXT = "Tatanka Level Lines: Edit Levels...";
 
@@ -62,7 +78,15 @@ namespace
 		IN_SHOW_PRICE_IN_LABEL,
 		IN_LABELS_ON_RIGHT,
 		IN_LABEL_ABOVE_LINE,
-		IN_LABEL_BACKGROUND
+		IN_LABEL_BACKGROUND,
+		IN_SHARING_MODE		// added in 1.1.0 at the end, so saved charts keep their inputs (shown first)
+	};
+
+	enum SharingMode
+	{
+		SHARE_OFF,
+		SHARE_SOURCE,
+		SHARE_FOLLOW
 	};
 
 	struct LineStroke
@@ -370,6 +394,303 @@ namespace
 		}
 		return lines;
 	}
+	// ---- Sharing (NinjaTrader 1.1.0: Sharing mode Off, Source, Follow) ----
+
+	// What a Source publishes and a Follow chart draws: the lines (prices, labels, colors, styles,
+	// widths), the range and its shading. Label display settings stay with each chart.
+	struct SharedLevels
+	{
+		std::vector<LevelLine>	Lines;				// range top, bottom, midpoint, then the custom lines
+		double					RangeTop	= 0;
+		double					RangeBottom	= 0;
+		bool					FillRange	= false;
+		uint32_t				FillColor	= 0;
+		int						FillOpacity	= 0;	// percent, clamped where it is drawn
+	};
+
+	bool SameStroke(const LineStroke& a, const LineStroke& b)
+	{
+		return a.Color == b.Color && a.Style == b.Style && a.Width == b.Width && a.Visible == b.Visible;
+	}
+
+	bool SameLevels(const SharedLevels& a, const SharedLevels& b)
+	{
+		if (a.Lines.size() != b.Lines.size() || a.RangeTop != b.RangeTop || a.RangeBottom != b.RangeBottom || a.FillRange != b.FillRange
+			|| a.FillColor != b.FillColor || a.FillOpacity != b.FillOpacity)
+			return false;
+		for (size_t i = 0; i < a.Lines.size(); i++)
+			if (a.Lines[i].Price != b.Lines[i].Price || a.Lines[i].Label != b.Lines[i].Label || !SameStroke(a.Lines[i].Stroke, b.Lines[i].Stroke))
+				return false;
+		return true;
+	}
+
+	// Full-size and micro roots quoted in the same price units, so one set of levels fits both.
+	// Each pair shares under the full-size root.
+	const char* const MICRO_PAIRS[][2] =
+	{
+		{"ES", "MES"}, {"NQ", "MNQ"}, {"YM", "MYM"}, {"RTY", "M2K"},
+		{"CL", "MCL"}, {"GC", "MGC"}, {"SI", "SIL"}, {"HG", "MHG"}
+	};
+
+	struct ShareKey
+	{
+		std::string	Key;		// charts with the same key share
+		std::string	Display;	// what the waiting message shows, e.g. "ES/MES 12-26"
+	};
+
+	// NinjaTrader shares by the contract's full name ("ES 12-26") with a micro root swapped for its
+	// full-size root, so MES 12-26 and ES 12-26 share and ES 12-26 and ES 03-27 don't. Sierra Chart
+	// symbols carry the contract as root, month code and year before any suffix: ESZ26_FUT_CME,
+	// MESZ26-CME, ESZ6.CME or ESZ26 all read as "ES 12-26" (any exchange suffix is ignored, as
+	// NinjaTrader's full name has none). A one-digit year is the year ending in that digit from last
+	// year to eight years ahead of referenceYear. Any other symbol (a stock, a continuous ES#) shares
+	// only with charts of exactly that symbol.
+	ShareKey ShareKeyOf(const std::string& symbol, int referenceYear)
+	{
+		const std::string text = Trim(symbol);
+		size_t end = 0;
+		while (end < text.size() && ((text[end] >= 'A' && text[end] <= 'Z') || (text[end] >= 'a' && text[end] <= 'z')
+			|| (text[end] >= '0' && text[end] <= '9')))
+			end++;
+		const bool suffixOk = end == text.size() || strchr("_-. ", text[end]) != nullptr;
+		size_t yearStart = end;
+		while (yearStart > 0 && text[yearStart - 1] >= '0' && text[yearStart - 1] <= '9')
+			yearStart--;
+		const size_t yearDigits = end - yearStart;
+		const char* const MONTH_CODES = "FGHJKMNQUVXZ";
+		const char code = yearStart >= 2 ? text[yearStart - 1] : '\0';
+		const char* const month = code != '\0' ? strchr(MONTH_CODES, code) : nullptr;
+		if (!suffixOk || month == nullptr || (yearDigits != 1 && yearDigits != 2 && yearDigits != 4))
+			return {text, text};
+
+		int year = atoi(text.substr(yearStart, yearDigits).c_str());
+		if (yearDigits == 1)
+		{
+			for (int candidate = referenceYear - 1; candidate <= referenceYear + 8; candidate++)
+				if ((candidate % 10 + 10) % 10 == year)
+				{
+					year = candidate;
+					break;
+				}
+		}
+		else if (yearDigits == 2)
+			year += 2000;
+
+		char contract[16];
+		snprintf(contract, sizeof(contract), " %02d-%02d", (int)(month - MONTH_CODES) + 1, (year % 100 + 100) % 100);
+		std::string root = text.substr(0, yearStart - 1);
+		for (char& c : root)
+			if (c >= 'a' && c <= 'z')
+				c = (char)(c - 'a' + 'A');
+		for (const auto& pair : MICRO_PAIRS)
+			if (root == pair[0] || root == pair[1])
+				return {std::string(pair[0]) + contract, std::string(pair[0]) + "/" + pair[1] + contract};
+		return {root + contract, root + contract};
+	}
+
+	// Every live Source's levels per share key, oldest first. Follow charts show the newest; when a
+	// Source goes away, the next newest takes over, or Follow charts go back to waiting when none is
+	// left (NinjaTrader's SharedLevelStore).
+	//
+	// Sierra Chart: the store is this DLL's memory, so it reaches every chart of one Sierra Chart
+	// instance, in every open chartbook, and nothing else: not another Sierra Chart running on the
+	// same PC, and nothing is saved (a restart or a DLL rebuild starts it empty, and each Source
+	// publishes again on its next call). A Source is a study instance, known by a number it is given
+	// once (OwnerOf), so renaming its chartbook changes nothing. It publishes on every full
+	// recalculation (loading, Apply, a changed input), which makes it the newest as NinjaTrader's
+	// Apply does, and on any other call when its levels changed (the levels editor). It withdraws
+	// when it is removed, its chart or chartbook closes, or it is switched to Off or Follow. A Follow
+	// chart reads the store whenever it draws, and while in Follow its study is called at the chart
+	// update interval (sc.UpdateAlways) so a Source's change and its range shading show without new
+	// data: a Follow chart redraws that often even when nothing moves.
+	class LevelStore
+	{
+	public:
+		std::shared_ptr<const SharedLevels> Get(const std::string& key)
+		{
+			std::shared_ptr<const SharedLevels> result;
+			AcquireSRWLockShared(&Lock);
+			const auto found = Sources.find(key);
+			if (found != Sources.end() && !found->second.empty())
+				result = found->second.back().Levels;
+			ReleaseSRWLockShared(&Lock);
+			return result;
+		}
+
+		// Publishes owner's levels under key as the newest, removing its earlier publication (under
+		// any key). Unless renew is set, the same levels already published under key change nothing.
+		// True when the store changed.
+		bool Publish(const std::string& key, const std::string& owner, const SharedLevels& levels, bool renew)
+		{
+			AcquireSRWLockExclusive(&Lock);
+			bool unchanged = false;
+			const auto found = Sources.find(key);
+			if (!renew && found != Sources.end())
+				for (const Publication& p : found->second)
+					if (p.Owner == owner && SameLevels(*p.Levels, levels))
+						unchanged = true;
+			if (!unchanged)
+			{
+				RemoveOwner(owner);
+				Sources[key].push_back({owner, std::make_shared<const SharedLevels>(levels)});
+			}
+			ReleaseSRWLockExclusive(&Lock);
+			return !unchanged;
+		}
+
+		// Removes only this owner's levels. True when it had any.
+		bool Withdraw(const std::string& owner)
+		{
+			AcquireSRWLockExclusive(&Lock);
+			const bool removed = RemoveOwner(owner);
+			ReleaseSRWLockExclusive(&Lock);
+			return removed;
+		}
+
+	private:
+		struct Publication
+		{
+			std::string							Owner;
+			std::shared_ptr<const SharedLevels>	Levels;
+		};
+
+		// Call while holding Lock.
+		bool RemoveOwner(const std::string& owner)
+		{
+			bool removed = false;
+			for (auto it = Sources.begin(); it != Sources.end();)
+			{
+				std::vector<Publication>& list = it->second;
+				const size_t before = list.size();
+				list.erase(std::remove_if(list.begin(), list.end(), [&owner](const Publication& p) { return p.Owner == owner; }), list.end());
+				removed = removed || list.size() != before;
+				it = list.empty() ? Sources.erase(it) : std::next(it);
+			}
+			return removed;
+		}
+
+		SRWLOCK												Lock = SRWLOCK_INIT;
+		std::map<std::string, std::vector<Publication>>	Sources;
+	};
+
+	LevelStore& Store()
+	{
+		static LevelStore store;
+		return store;
+	}
+
+	// A number no study instance in this Sierra Chart has had before: the performance counter when
+	// it is handed out, or one more than the last number if the counter has not moved since. The
+	// counter runs on through a DLL release (a rebuild), which starts this DLL's memory again, so a
+	// reloaded DLL never hands out a number an instance may still hold from before.
+	volatile LONG64 g_LastOwnerToken = 0;
+
+	std::int64_t NewOwnerToken()
+	{
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		for (;;)
+		{
+			const LONG64 last = g_LastOwnerToken;
+			const LONG64 next = (std::max)((LONG64)now.QuadPart, last + 1);
+			if (InterlockedCompareExchange64(&g_LastOwnerToken, next, last) == last)
+				return next;
+		}
+	}
+
+	// ---- Label price ----
+
+	// Sierra's tick size is a float in older versions (0.1f is 0.100000001490116) and a double in
+	// newer ones. This is the decimal tick it stands for.
+	double DecimalTickSize(double tickSize)
+	{
+		if (!(tickSize > 0))
+			return 0;
+		char text[32];
+		snprintf(text, sizeof(text), "%.6g", tickSize);
+		return strtod(text, nullptr);
+	}
+
+	// .NET Framework's double.ToString("0.00####", InvariantCulture) shape: the value's 15
+	// significant digits rounded half away from zero to maxDecimals, trailing zeros dropped down to
+	// minDecimals.
+	std::string FormatNetDecimals(double value, int minDecimals, int maxDecimals)
+	{
+		if (!std::isfinite(value))
+			return value != value ? "NaN" : value > 0 ? "Infinity" : "-Infinity";
+		char scientific[40];
+		snprintf(scientific, sizeof(scientific), "%.14e", std::fabs(value));	// d.dddddddddddddde+xx
+		std::string digits(1, scientific[0]);
+		digits.append(scientific + 2, 14);
+		const int pointAt = atoi(strchr(scientific, 'e') + 1) + 1;	// digits before the decimal point
+
+		std::string whole, fraction;
+		if (pointAt <= 0)
+		{
+			whole = "0";
+			fraction = std::string((size_t)-pointAt, '0') + digits;
+		}
+		else if (pointAt >= (int)digits.size())
+			whole = digits + std::string((size_t)pointAt - digits.size(), '0');
+		else
+		{
+			whole = digits.substr(0, (size_t)pointAt);
+			fraction = digits.substr((size_t)pointAt);
+		}
+
+		if ((int)fraction.size() > maxDecimals)
+		{
+			bool up = fraction[(size_t)maxDecimals] >= '5';
+			fraction.resize((size_t)maxDecimals);
+			for (size_t i = fraction.size(); up && i-- > 0;)
+			{
+				if (fraction[i] == '9')
+					fraction[i] = '0';
+				else
+				{
+					fraction[i]++;
+					up = false;
+				}
+			}
+			for (size_t i = whole.size(); up && i-- > 0;)
+			{
+				if (whole[i] == '9')
+					whole[i] = '0';
+				else
+				{
+					whole[i]++;
+					up = false;
+				}
+			}
+			if (up)
+				whole.insert(whole.begin(), '1');
+		}
+		if ((int)fraction.size() < minDecimals)
+			fraction.append((size_t)minDecimals - fraction.size(), '0');
+		while ((int)fraction.size() > minDecimals && fraction.back() == '0')
+			fraction.pop_back();
+
+		const bool zero = whole.find_first_not_of('0') == std::string::npos && fraction.find_first_not_of('0') == std::string::npos;
+		return (value < 0 && !zero ? "-" : "") + whole + (fraction.empty() ? "" : "." + fraction);
+	}
+
+	// The price in a label (NinjaTrader 1.1.1): the chart's price format, except for a line between
+	// ticks (a range's mid on an odd number of ticks, a level typed off the tick), which is labelled
+	// at its own price with the format's decimals and up to four more: 5027.625 on ES (formatted
+	// 5027.63), 7845.10 typed on ES, 2600.15 on GC (formatted 2600.2).
+	std::string LabelPrice(const std::string& formatted, double price, double tickSize)
+	{
+		if (!(tickSize > 0))
+			return formatted;
+		const double ticks = price / tickSize;
+		if (!(std::fabs(ticks - std::round(ticks)) > 1e-6))
+			return formatted;
+		const size_t dot = formatted.find('.');
+		const int decimals = dot == std::string::npos ? 0 : (int)(formatted.size() - dot - 1);
+		const int minDecimals = (std::max)(1, decimals);
+		return FormatNetDecimals(price, minDecimals, minDecimals + 4);
+	}
+
 	// ---- Label layout ----
 
 	struct PendingLabel
@@ -1061,13 +1382,76 @@ namespace
 			return SCString(text.c_str());
 
 		const SCString formatted = sc.FormatGraphValue(price, sc.BaseGraphValueFormat);
-		if (text.empty())
-			return formatted;
+		const std::string p = LabelPrice(formatted.GetChars(), price, DecimalTickSize((double)sc.TickSize));
+		const std::string result = text.empty() ? p : text + "  " + p;
+		return SCString(result.c_str());
+	}
 
-		SCString result(text.c_str());
-		result += "  ";
-		result += formatted;
-		return result;
+	int SharingModeOf(SCStudyInterfaceRef sc)
+	{
+		return (std::min)((int)sc.Input[IN_SHARING_MODE].GetIndex(), (int)SHARE_FOLLOW);
+	}
+
+	ShareKey ShareKeyOf(SCStudyInterfaceRef sc)
+	{
+		return ShareKeyOf(sc.Symbol.GetChars(), sc.CurrentSystemDateTime.GetYear());
+	}
+
+	// This study instance, as the store's owner of what it publishes: its chart number and study ID
+	// with a number it is given on its first call and keeps for its life (NinjaTrader's sourceToken
+	// object). The chartbook's name would not do: it can change under a running study (Save
+	// Chartbook As, the first save of a new chartbook), and two open chartbooks may share it. A
+	// Source would then publish under a new owner and leave its old levels in the store, where no
+	// switch to Off or Follow and no removal would withdraw them, or replace another chartbook's
+	// Source.
+	std::string OwnerOf(SCStudyInterfaceRef sc)
+	{
+		std::int64_t& token = sc.GetPersistentInt64(PI64_OWNER_TOKEN);
+		if (token == 0)
+			token = NewOwnerToken();
+		return std::to_string(sc.ChartNumber) + "|" + std::to_string(sc.StudyGraphInstanceID) + "|" + std::to_string(token);
+	}
+
+	// This chart's own levels (Off and Source): range lines first, then the custom list.
+	SharedLevels LocalLevels(SCStudyInterfaceRef sc, const std::string& customLevels)
+	{
+		SharedLevels levels;
+		levels.RangeTop		= sc.Input[IN_RANGE_TOP].GetDouble();
+		levels.RangeBottom	= sc.Input[IN_RANGE_BOTTOM].GetDouble();
+		const bool hasTop		= levels.RangeTop > 0;
+		const bool hasBottom	= levels.RangeBottom > 0;
+		if (hasTop)
+			levels.Lines.push_back({levels.RangeTop, sc.Input[IN_RANGE_TOP_LABEL].GetString(), StrokeFromSubgraph(sc.Subgraph[SG_RANGE_LINE])});
+		if (hasBottom)
+			levels.Lines.push_back({levels.RangeBottom, sc.Input[IN_RANGE_BOTTOM_LABEL].GetString(), StrokeFromSubgraph(sc.Subgraph[SG_RANGE_LINE])});
+		if (sc.Input[IN_SHOW_RANGE_MID].GetYesNo() && hasTop && hasBottom)
+			levels.Lines.push_back({(levels.RangeTop + levels.RangeBottom) / 2.0, sc.Input[IN_RANGE_MID_LABEL].GetString(),
+				StrokeFromSubgraph(sc.Subgraph[SG_RANGE_MID_LINE])});
+
+		const std::vector<LevelLine> customLines = ParseCustomLevels(customLevels, StrokeFromSubgraph(sc.Subgraph[SG_DEFAULT_LINE]));
+		levels.Lines.insert(levels.Lines.end(), customLines.begin(), customLines.end());
+
+		levels.FillRange	= sc.Input[IN_FILL_RANGE].GetYesNo() != 0;
+		levels.FillColor	= sc.Subgraph[SG_RANGE_SHADE].PrimaryColor;
+		levels.FillOpacity	= sc.Input[IN_RANGE_FILL_OPACITY].GetInt();
+		return levels;
+	}
+
+	// NinjaTrader's "Level Lines: waiting for Source on ES/MES 12-26": gray Arial 12 DIPs, 8 DIPs in
+	// from the panel's left and 24 down from its top. Call with the clipping region set.
+	void DrawWaitingForSource(SCStudyInterfaceRef sc, int x0, int yTop, const std::string& display)
+	{
+		n_ACSIL::s_GraphicsFont font;
+		font.m_FaceName	= "Arial";
+		font.m_Height	= 9;  // 12 DIPs
+		font.m_Weight	= FW_NORMAL;
+		sc.Graphics.SetTextFont(font);
+		sc.Graphics.SetBackgroundMode(TRANSPARENT);
+		sc.Graphics.SetTextAlign(TA_NOUPDATECP | TA_LEFT | TA_TOP);
+		const double scale = DipScale(sc, font);
+		sc.Graphics.SetTextColor(GraphicsColor(RGB(128, 128, 128)));
+		const std::string text = "Level Lines: waiting for Source on " + display;
+		sc.Graphics.DrawTextAt(SCString(text.c_str()), x0 + (int)(8 * scale + 0.5), yTop + (int)(24 * scale + 0.5));
 	}
 
 	void DrawLevelLines(HWND, HDC, SCStudyInterfaceRef sc)
@@ -1082,25 +1466,7 @@ namespace
 		if (x1 <= x0 || yBottom <= yTop)
 			return;
 
-		const double rangeTop		= sc.Input[IN_RANGE_TOP].GetDouble();
-		const double rangeBottom	= sc.Input[IN_RANGE_BOTTOM].GetDouble();
-		const bool hasTop			= rangeTop > 0;
-		const bool hasBottom		= rangeBottom > 0;
-		const bool showPrice		= sc.Input[IN_SHOW_PRICE_IN_LABEL].GetYesNo() != 0;
-
-		// Every line: range lines first, then the custom list.
-		std::vector<LevelLine> items;
-		if (hasTop)
-			items.push_back({rangeTop, sc.Input[IN_RANGE_TOP_LABEL].GetString(), StrokeFromSubgraph(sc.Subgraph[SG_RANGE_LINE])});
-		if (hasBottom)
-			items.push_back({rangeBottom, sc.Input[IN_RANGE_BOTTOM_LABEL].GetString(), StrokeFromSubgraph(sc.Subgraph[SG_RANGE_LINE])});
-		if (sc.Input[IN_SHOW_RANGE_MID].GetYesNo() && hasTop && hasBottom)
-			items.push_back({(rangeTop + rangeBottom) / 2.0, sc.Input[IN_RANGE_MID_LABEL].GetString(), StrokeFromSubgraph(sc.Subgraph[SG_RANGE_MID_LINE])});
-
-		std::string customLevels = sc.Input[IN_CUSTOM_LEVELS].GetString();
-		PendingEditorText(sc, PP_EDITOR, customLevels);
-		const std::vector<LevelLine> customLines = ParseCustomLevels(customLevels, StrokeFromSubgraph(sc.Subgraph[SG_DEFAULT_LINE]));
-		items.insert(items.end(), customLines.begin(), customLines.end());
+		const bool showPrice = sc.Input[IN_SHOW_PRICE_IN_LABEL].GetYesNo() != 0;
 
 		n_ACSIL::s_GraphicsRectangle clip;
 		clip.Left	= x0;
@@ -1108,6 +1474,35 @@ namespace
 		clip.Right	= x1;
 		clip.Bottom	= yBottom;
 		sc.Graphics.SetClippingRegionFromRectangle(clip);
+
+		// Follow draws the newest Source's levels, read now so a change shows at the next repaint;
+		// Off and Source draw this chart's own (with the editor's saved text before the next call).
+		std::shared_ptr<const SharedLevels> shared;
+		SharedLevels local;
+		const SharedLevels* levels = &local;
+		if (SharingModeOf(sc) == SHARE_FOLLOW)
+		{
+			const ShareKey key = ShareKeyOf(sc);
+			shared = Store().Get(key.Key);
+			levels = shared.get();
+			if (levels == nullptr)
+			{
+				DrawWaitingForSource(sc, x0, yTop, key.Display);
+				sc.Graphics.ResetTextAlign();
+				sc.Graphics.ResetBackgroundMode();
+				sc.Graphics.ResetTextColor();
+				sc.Graphics.ResetTextFont();
+				sc.Graphics.ResetClippingRegion();
+				return;
+			}
+		}
+		else
+		{
+			std::string customLevels = sc.Input[IN_CUSTOM_LEVELS].GetString();
+			PendingEditorText(sc, PP_EDITOR, customLevels);
+			local = LocalLevels(sc, customLevels);
+		}
+		const std::vector<LevelLine>& items = levels->Lines;
 
 		n_ACSIL::s_GraphicsFont font;
 		font.m_FaceName	= sc.Input[IN_LABEL_FONT_NAME].GetString();
@@ -1184,15 +1579,20 @@ namespace
 		sc.Graphics.ResetTextFont();
 		sc.Graphics.ResetClippingRegion();
 	}
-	// The range shading: a Rectangle Highlight drawing extended both ways.
-	void UpdateRangeShade(SCStudyInterfaceRef sc)
+	// The range shading: a Rectangle Highlight drawing extended both ways, from this chart's levels
+	// or, on a Follow chart, the Source's (none when levels is null).
+	void UpdateRangeShade(SCStudyInterfaceRef sc, const SharedLevels* levels)
 	{
-		int& lineNumber = sc.GetPersistentInt(PI_SHADE_LINE);
+		int& lineNumber		= sc.GetPersistentInt(PI_SHADE_LINE);
+		int& drawnColor		= sc.GetPersistentInt(PI_SHADE_COLOR);
+		int& drawnOpacity	= sc.GetPersistentInt(PI_SHADE_OPACITY);
+		double& drawnTop	= sc.GetPersistentDouble(PD_SHADE_TOP);
+		double& drawnBottom	= sc.GetPersistentDouble(PD_SHADE_BOTTOM);
 
-		const double rangeTop		= sc.Input[IN_RANGE_TOP].GetDouble();
-		const double rangeBottom	= sc.Input[IN_RANGE_BOTTOM].GetDouble();
+		const double rangeTop		= levels != nullptr ? levels->RangeTop : 0;
+		const double rangeBottom	= levels != nullptr ? levels->RangeBottom : 0;
 		const bool wantShade		= !sc.LastCallToFunction && !sc.HideStudy && sc.ArraySize > 0
-									  && sc.Input[IN_FILL_RANGE].GetYesNo() && rangeTop > 0 && rangeBottom > 0;
+									  && levels != nullptr && levels->FillRange && rangeTop > 0 && rangeBottom > 0;
 
 		if (lineNumber != 0 && sc.ChartDrawingExists(sc.ChartNumber, lineNumber) == 0)
 			lineNumber = 0;
@@ -1205,12 +1605,14 @@ namespace
 			return;
 		}
 
-		// Inputs and subgraph colors only change through a full recalculation.
-		if (lineNumber != 0 && !sc.IsFullRecalculation)
-			return;
+		const uint32_t shadeColor	= levels->FillColor;
+		const int opacity			= (std::max)(0, (std::min)(100, levels->FillOpacity));
 
-		const uint32_t shadeColor	= sc.Subgraph[SG_RANGE_SHADE].PrimaryColor;
-		const int opacity			= (std::max)(0, (std::min)(100, sc.Input[IN_RANGE_FILL_OPACITY].GetInt()));
+		// This chart's inputs and subgraph colors only change through a full recalculation; a
+		// Source's change reaches a Follow chart on any call.
+		if (lineNumber != 0 && !sc.IsFullRecalculation && drawnTop == rangeTop && drawnBottom == rangeBottom
+			&& drawnColor == (int)shadeColor && drawnOpacity == opacity)
+			return;
 
 		s_UseTool tool;
 		tool.Clear();
@@ -1234,7 +1636,13 @@ namespace
 		tool.AddAsUserDrawnDrawing		= 0;
 
 		if (sc.UseTool(tool) > 0)
-			lineNumber = tool.LineNumber;
+		{
+			lineNumber		= tool.LineNumber;
+			drawnTop		= rangeTop;
+			drawnBottom		= rangeBottom;
+			drawnColor		= (int)shadeColor;
+			drawnOpacity	= opacity;
+		}
 	}
 }
 
@@ -1243,8 +1651,9 @@ SCSFExport scsf_TatankaLevelLines(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName		= "Tatanka Level Lines";
-		sc.StudyDescription	= "Tatanka Level Lines v1.0.0: labeled horizontal levels. A range box (top, bottom, midpoint, shading) "
-							  "plus any number of custom lines typed as price|label|color|style|width (right-click the chart for Edit Levels...). "
+		sc.StudyDescription	= "Tatanka Level Lines v1.1.1: labeled horizontal levels. A range box (top, bottom, midpoint, shading) "
+							  "plus any number of custom lines typed as price|label|color|style|width (right-click the chart for Edit Levels...), "
+							  "with optional Source/Follow sharing between charts of the same contract (micro and full-size included). "
 							  "Line colors, styles and widths are on the Subgraphs tab. Free and open source (MPL 2.0). tatankatrading.com";
 		sc.GraphRegion		= 0;
 		sc.AutoLoop			= 0;
@@ -1335,18 +1744,38 @@ SCSFExport scsf_TatankaLevelLines(SCStudyInterfaceRef sc)
 		sc.Input[IN_LABEL_BACKGROUND].Name = "Label Background";
 		sc.Input[IN_LABEL_BACKGROUND].SetYesNo(1);
 
+		// NinjaTrader's "0. Sharing" group comes first. Existing charts load with sharing Off.
+		sc.Input[IN_SHARING_MODE].Name = "Sharing Mode";
+		sc.Input[IN_SHARING_MODE].SetCustomInputStrings("Off;Source;Follow");
+		sc.Input[IN_SHARING_MODE].SetCustomInputIndex(SHARE_OFF);
+		sc.Input[IN_SHARING_MODE].SetDescription(
+			"Off: use this chart's settings. Source: publish levels, labels, line styles and range shading for this contract month. "
+			"Follow: display the Source's levels. Add this study to every participating chart. A micro shares with its full-size contract "
+			"(ES/MES, NQ/MNQ, YM/MYM, RTY/M2K, CL/MCL, GC/MGC, SI/SIL, HG/MHG), same month only. Use one Source per contract; if several "
+			"are running, the newest wins. Label display settings remain local to each chart. Charts share within this Sierra Chart, "
+			"in every open chartbook.");
+
+		// Shown in NinjaTrader's order: Sharing Mode first, then the inputs as before.
+		sc.Input[IN_SHARING_MODE].DisplayOrder = 1;
+		for (int i = IN_RANGE_TOP; i <= IN_LABEL_BACKGROUND; i++)
+			sc.Input[i].DisplayOrder = (uint16_t)(i + 2);
+
 		return;
 	}
 
 	int& editMenuId = sc.GetPersistentInt(PI_EDIT_MENU_ID);
+	const std::string owner = OwnerOf(sc);
 
 	if (sc.LastCallToFunction)
 	{
+		// Removing a Source, closing its chart or chartbook sends its Follow charts back to waiting
+		// (or to another Source of the contract) instead of leaving stale lines on them.
+		Store().Withdraw(owner);
 		PollEditor(sc, PP_EDITOR, IN_CUSTOM_LEVELS, true);
 		if (editMenuId > 0)
 			sc.RemoveACSChartShortcutMenuItem(sc.ChartNumber, editMenuId);
 		editMenuId = 0;
-		UpdateRangeShade(sc);
+		UpdateRangeShade(sc, nullptr);
 		return;
 	}
 
@@ -1359,5 +1788,30 @@ SCSFExport scsf_TatankaLevelLines(SCStudyInterfaceRef sc)
 		OpenEditor(sc, PP_EDITOR, LevelsEditorTexts(), sc.Input[IN_CUSTOM_LEVELS].GetString());
 	PollEditor(sc, PP_EDITOR, IN_CUSTOM_LEVELS, false);
 
-	UpdateRangeShade(sc);
+	// Sharing: a Source publishes its levels (renewed as the newest on a full recalculation, as
+	// NinjaTrader's Apply does); Off and Follow withdraw anything this instance published.
+	const int mode = SharingModeOf(sc);
+	std::shared_ptr<const SharedLevels> shared;
+	SharedLevels local;
+	const SharedLevels* levels = &local;
+	if (mode == SHARE_FOLLOW)
+	{
+		Store().Withdraw(owner);
+		shared = Store().Get(ShareKeyOf(sc).Key);
+		levels = shared.get();
+	}
+	else
+	{
+		local = LocalLevels(sc, sc.Input[IN_CUSTOM_LEVELS].GetString());
+		if (mode == SHARE_SOURCE)
+			Store().Publish(ShareKeyOf(sc).Key, owner, local, sc.IsFullRecalculation != 0);
+		else
+			Store().Withdraw(owner);
+	}
+
+	// A Follow chart is called at the chart update interval, so a Source's change (and its range
+	// shading) shows without new data; otherwise only while the levels editor is open.
+	sc.UpdateAlways = (mode == SHARE_FOLLOW || sc.GetPersistentPointer(PP_EDITOR) != nullptr) ? 1 : 0;
+
+	UpdateRangeShade(sc, levels);
 }

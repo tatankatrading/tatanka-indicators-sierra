@@ -13,7 +13,12 @@
 // transparent Rectangle Highlight drawings, since the callback can't draw
 // transparency; the other translucent colors are blended over the background.
 // The daily ATR comes from a hidden daily chart, opened only when Position
-// coloring or ATR zones are on.
+// coloring or ATR zones are on, and read only while it holds this chart's
+// symbol (no ATR otherwise). Its days are full trading days, so on an RTH-only
+// chart the ATR is wider than NinjaTrader's (its daily series follows the chart's
+// trading hours). Text is Arial in whole points: NinjaTrader's 10, 12, 14 and 20
+// DIPs are 8, 9, 11 and 15 pt (the half points round up). The border color has no
+// opacity input (NinjaTrader's color picker has one; its default border is opaque).
 
 #include "sierrachart.h"
 
@@ -76,16 +81,18 @@ namespace
 	const int PI_EDIT_MENU_ID		= 5;
 	const int PI_ZONE_LINE_BASE		= 100;  // 100..199: zone drawing line numbers
 	const int PP_EDITOR				= 1;
+	const int PP_DAILY				= 2;	// DailyChartState
 
 	const int MAX_LEVELS = 100;  // Pine garbage-collects the oldest shapes beyond max_*_count = 100
 
 	const char* const EDIT_MENU_TEXT	= "Tatanka If/Then: Edit Rows...";
 	const char* const PASTE_MENU_TEXT	= "Tatanka If/Then: Paste Rows from Clipboard";
 
-	// Pine's color.gray, color.silver and color.white (NinjaTrader approximates the first two).
-	const uint32_t PINE_GRAY	= RGB(120, 123, 134);
-	const uint32_t PINE_SILVER	= RGB(178, 181, 190);
-	const uint32_t PINE_WHITE	= RGB(255, 255, 255);
+	// NinjaTrader's table colors: the header's price cell is gray with no row to take its bias color from,
+	// an inactive row's text is silver at 70% (TradingView's color.gray and color.silver are bluer).
+	const uint32_t TABLE_GRAY	= RGB(128, 128, 128);
+	const uint32_t TABLE_SILVER	= RGB(192, 192, 192);
+	const uint32_t TABLE_WHITE	= RGB(255, 255, 255);
 
 	// UTF-8 escapes keep these bytes the same whatever the compiler's source charset.
 	#define TATANKA_ARROW	"\xE2\x86\x92"	// →
@@ -456,18 +463,41 @@ namespace
 			mix(GetBValue(color), GetBValue(background)));
 	}
 
+	// The table's colors (NinjaTrader's Table): the bias color of a row, and of the header (the active row's,
+	// gray with none); the text of cell (r, c) over `fill` (r = 0: the header).
+	uint32_t HeaderBiasColor(const std::vector<BiasRow>& rows, int active)
+	{
+		return active >= 0 && active < (int)rows.size() ? BiasColor(rows[(size_t)active].Bias) : TABLE_GRAY;
+	}
+
+	uint32_t CellTextColor(int r, int c, bool isActive, uint32_t bias, uint32_t fill)
+	{
+		return r == 0 ? TABLE_WHITE : c < 2 ? bias : isActive ? TABLE_WHITE : Blend(TABLE_SILVER, 0.70, fill);
+	}
+
 	// ---- Rendering ----
 
 	// On/off run lengths in multiples of the line width, matching NinjaTrader's Direct2D
-	// styles: Dash = 2 on, 2 off; Dot = round dots one line width across, one width apart.
-	// Drawn as filled rectangles, so styled lines keep their width (GDI pens draw wide
-	// dashed lines solid).
+	// styles: Dash = 2 on, 2 off (flat caps). Dotted is drawn by DrawHorizontalLine as
+	// round dots. Drawn as filled rectangles, so styled lines keep their width (GDI pens
+	// draw wide dashed lines solid).
 	const std::vector<int>& DashPattern(int style)
 	{
 		static const std::vector<int> solid;
 		static const std::vector<int> dash	= {2, 2};
-		static const std::vector<int> dot	= {1, 1};
-		return style == LS_DASHED ? dash : style == LS_DOTTED ? dot : solid;
+		return style == LS_DASHED ? dash : solid;
+	}
+
+	// Row `row` of a round dot `width` pixels across: the columns [left, right) of the pixels
+	// whose centers lie in the circle. NinjaTrader's Dotted is Direct2D's Dot ({0, 2}) with
+	// round caps: a disc one line width across every two widths.
+	void DotRowSpan(int width, int row, int& left, int& right)
+	{
+		const double radius	= width / 2.0;
+		const double dy		= row + 0.5 - radius;
+		const double half	= std::sqrt((std::max)(0.0, radius * radius - dy * dy));
+		left	= (int)std::ceil(radius - half - 0.5);
+		right	= (int)std::floor(radius + half - 0.5) + 1;
 	}
 
 	n_ACSIL::s_GraphicsColor GraphicsColor(uint32_t colorref)
@@ -493,8 +523,34 @@ namespace
 	{
 		width = (std::max)(1, width);
 		const int top = y - width / 2;
-		const std::vector<int>& pattern = DashPattern(style);
 
+		if (style == LS_DOTTED)
+		{
+			// A dot centered every two widths from the line's start (the first one half
+			// cut off, as NinjaTrader's), its rows of equal span drawn as one rectangle.
+			for (int center = x0; center - width / 2 < x1; center += 2 * width)
+			{
+				const int left = center - width / 2;
+				int runTop = 0, runLeft = 0, runRight = 0;
+				for (int row = 0; row <= width; row++)
+				{
+					int spanLeft = 0, spanRight = 0;
+					if (row < width)
+						DotRowSpan(width, row, spanLeft, spanRight);
+					if (row == width || row == 0 || spanLeft != runLeft || spanRight != runRight)
+					{
+						if (row > runTop)
+							FillRect(sc, (std::max)(x0, left + runLeft), top + runTop, (std::min)(x1, left + runRight), top + row, color);
+						runTop		= row;
+						runLeft		= spanLeft;
+						runRight	= spanRight;
+					}
+				}
+			}
+			return;
+		}
+
+		const std::vector<int>& pattern = DashPattern(style);
 		if (pattern.empty())
 		{
 			FillRect(sc, x0, top, x1, top + width, color);
@@ -757,8 +813,7 @@ namespace
 			for (int r = 0; r < count; r++)
 			{
 				const bool isActive	= r > 0 && r - 1 == active;
-				const uint32_t bias	= r == 0 ? (active >= 0 ? BiasColor(rows[(size_t)active].Bias) : PINE_GRAY)
-					: BiasColor(rows[(size_t)r - 1].Bias);
+				const uint32_t bias	= r == 0 ? HeaderBiasColor(rows, active) : BiasColor(rows[(size_t)r - 1].Bias);
 				const uint32_t rowBackground = isActive ? Blend(bias, activeOpacity, chartBackground) : background;
 
 				int cellX = left;
@@ -768,8 +823,7 @@ namespace
 					FillRect(sc, cellX, cellY, cellX + widths[c], cellY + heights[(size_t)r], fill);
 
 					const Align align = c == 0 || (r == 0 && c == 1) ? ALIGN_CENTER : c == 1 ? ALIGN_RIGHT : ALIGN_LEFT;
-					const uint32_t foreground = r == 0 ? PINE_WHITE : c < 2 ? bias
-						: isActive ? PINE_WHITE : Blend(PINE_SILVER, 0.70, fill);
+					const uint32_t foreground = CellTextColor(r, c, isActive, bias, fill);
 					const TextBlock& cell = cells[(size_t)r * 3 + c];
 					DrawTextBlock(sc, cell, lineHeight, cellX + dip(8), cellX + widths[c] - dip(8),
 						cellY + (heights[(size_t)r] - cell.Height) / 2, align, foreground);
@@ -1399,24 +1453,82 @@ namespace
 		}
 	}
 
-	// Previous daily ATR from a hidden daily chart of the same symbol, like
-	// NinjaTrader's separate daily series: works on a chart loading only a few days.
+	// What the hidden daily chart was resolved for: this chart's symbol then; whether the chart handed back held
+	// another symbol (not used until a full recalculation or a new symbol), and whether the Message Log says so.
+	struct DailyChartState
+	{
+		bool		Resolved	= false;
+		std::string	Requested;
+		bool		Mismatch	= false;
+		bool		Logged		= false;
+	};
+
+	std::string ChartSymbol(SCStudyInterfaceRef sc, int chartNumber)
+	{
+		const SCString symbol = sc.GetChartSymbol(chartNumber);
+		return symbol.GetChars();
+	}
+
+	// Previous daily ATR from a hidden daily chart of the same symbol, like NinjaTrader's separate daily
+	// series: works on a chart loading only a few days. Sierra Chart hands every chart of the chartbook the
+	// same matching hidden chart (TPO Profile and the AMT Toolkit read it too), so the study never changes it:
+	// a chart switched to another symbol gets a daily chart of that symbol, found or opened
+	// (UpdatePriorChartNumberParametersToMatch = 0; the old one stays for the charts still reading it). Like
+	// NinjaTrader's daily series, the ATR must be this chart's own symbol's, so the daily chart's symbol is
+	// checked on every call as well: if it no longer holds this chart's symbol (another study or the user
+	// changed it), it is resolved again without it as the prior chart. A daily chart handed back with another
+	// symbol is not read: there is no ATR (the Message Log says why, once), and it is looked for again on the
+	// next full recalculation or when this chart's symbol changes.
 	double DailyAtr(SCStudyInterfaceRef sc)
 	{
 		int& chartNumber = sc.GetPersistentInt(PI_DAILY_CHART);
-		if (sc.IsFullRecalculation || chartNumber == 0)
+		void*& slot = sc.GetPersistentPointer(PP_DAILY);
+		if (slot == nullptr)
+			slot = new DailyChartState();
+		DailyChartState& state		= *static_cast<DailyChartState*>(slot);
+		const std::string symbol	= sc.GetRealTimeSymbol().GetChars();
+		const bool changed			= !state.Resolved || symbol != state.Requested;
+		if (state.Mismatch && !sc.IsFullRecalculation && !changed)
+			return std::numeric_limits<double>::quiet_NaN();
+		int prior		= chartNumber;
+		bool resolve	= sc.IsFullRecalculation || chartNumber == 0 || changed;
+		if (!resolve && ChartSymbol(sc, chartNumber) != symbol)
 		{
-			s_ACSOpenChartParameters params;
-			params.PriorChartNumber						= chartNumber;
-			params.ChartDataType						= DAILY_DATA;
-			params.Symbol								= sc.GetRealTimeSymbol();
-			params.HistoricalChartBarPeriod				= HISTORICAL_CHART_PERIOD_DAYS;
-			params.HistoricalChartBarPeriodLengthInDays	= 1;
-			params.DaysToLoad							= 3000;  // about NinjaTrader's 2,048 daily bars
-			params.ContinuousFuturesContractOption		= sc.ContinuousFuturesContractOption;
-			params.HideNewChart							= 1;
-			params.UpdatePriorChartNumberParametersToMatch = 1;
-			chartNumber = sc.OpenChartOrGetChartReference(params);
+			resolve	= true;
+			prior	= 0;
+		}
+		if (resolve)
+		{
+			state.Mismatch = false;
+			for (int attempt = 0; attempt < 2; attempt++)
+			{
+				s_ACSOpenChartParameters params;
+				params.PriorChartNumber						= prior;
+				params.ChartDataType						= DAILY_DATA;
+				params.Symbol								= symbol.c_str();
+				params.HistoricalChartBarPeriod				= HISTORICAL_CHART_PERIOD_DAYS;
+				params.HistoricalChartBarPeriodLengthInDays	= 1;
+				params.DaysToLoad							= 3000;  // about NinjaTrader's 2,048 daily bars
+				params.ContinuousFuturesContractOption		= sc.ContinuousFuturesContractOption;
+				params.HideNewChart							= 1;
+				params.UpdatePriorChartNumberParametersToMatch = 0;	// never rewrite a chart other charts read
+				chartNumber = sc.OpenChartOrGetChartReference(params);
+				if (chartNumber == 0 || ChartSymbol(sc, chartNumber) == symbol)
+					break;
+				// Another symbol's chart: asked again without the prior chart, then not used.
+				if (prior == 0 || attempt == 1)
+				{
+					chartNumber		= 0;
+					state.Mismatch	= true;
+					break;
+				}
+				prior = 0;
+			}
+			state.Resolved	= true;
+			state.Requested	= symbol;
+			if (state.Mismatch && !state.Logged)
+				sc.AddMessageToLog("Tatanka If/Then: couldn't open a daily chart of this symbol, so Position coloring and ATR zones have no daily ATR.", 0);
+			state.Logged = state.Mismatch;
 		}
 		if (chartNumber == 0)
 			return std::numeric_limits<double>::quiet_NaN();
@@ -1548,6 +1660,8 @@ SCSFExport scsf_TatankaIfThenBiasTable(SCStudyInterfaceRef sc)
 		sc.GraphRegion		= 0;
 		sc.AutoLoop			= 0;
 		sc.ValueFormat		= VALUEFORMAT_INHERITED;
+		// NinjaTrader's label is the name alone (DisplayName = Name), not its inputs and rows.
+		sc.DisplayStudyInputValues = 0;
 
 		sc.Input[IN_INSTRUMENT_LABEL].Name = "Instrument Label";
 		sc.Input[IN_INSTRUMENT_LABEL].SetString("ES");
@@ -1685,6 +1799,9 @@ SCSFExport scsf_TatankaIfThenBiasTable(SCStudyInterfaceRef sc)
 		editMenuId	= 0;
 		pasteMenuId	= 0;
 		UpdateZones(sc, std::vector<BiasRow>(), 0, 0);
+		void*& daily = sc.GetPersistentPointer(PP_DAILY);
+		delete static_cast<DailyChartState*>(daily);
+		daily = nullptr;
 		return;
 	}
 

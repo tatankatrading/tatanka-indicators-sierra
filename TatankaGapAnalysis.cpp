@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tatanka Trading LLC.
 // This Source Code Form is subject to the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, obtain one at https://mozilla.org/MPL/2.0/.
-// Tatanka Gap Analysis v1.0.0 for Sierra Chart - tatankatrading.com
+// Tatanka Gap Analysis v1.1.0 for Sierra Chart - tatankatrading.com
 // Sierra Chart port of the NinjaTrader 8 / Pine v6 "Gap Analysis".
 //
 // The gap between one RTH session's last chart-bar close (the fill target) and the next
@@ -10,6 +10,13 @@
 // with no Sierra Chart calls, so the tests can include this file. Sierra bars are stamped
 // at their START, NinjaTrader's at their end, so a bar is classified by its start plus
 // the bar length, converted to Chicago time.
+//
+// Use Instrument Hours (NinjaTrader v1.1.0, on by default): RTH start and end are written for
+// ES's regular hours (08:30-15:00 CT); on another market each moves to that market's own hours
+// (GC 07:20-12:30, CL 08:00-13:30), by the root read from the chart's symbol as the AMT Toolkit
+// port reads it (CQG's and IQFeed's forms included). Off, they run as typed on every market, as in
+// v1.0.0. A symbol whose market the hours table doesn't list (BTCZ26) gets a note in the Message
+// Log (Sierra Chart only).
 //
 // The live bar is recalculated on every tick: the engine state before the last bar is
 // kept as a checkpoint, restored, and the bar processed again with its current prices.
@@ -66,7 +73,9 @@ namespace
 		IN_ALERT_NEW,
 		IN_ALERT_FILL,
 		IN_ALERT_SOUND,
-		IN_ALERT_SOUND_FILE
+		IN_ALERT_SOUND_FILE,
+		IN_USE_HOURS,		// added in 1.1.0 at the end, so saved charts keep their inputs (shown after RTH end)
+		IN_COUNT
 	};
 
 	enum LineStyleOption { LS_SOLID, LS_DASHED, LS_DOTTED };
@@ -74,6 +83,7 @@ namespace
 
 	// Persistent variable keys
 	const int PP_STATE = 1;
+	const int PI_HOURS_NOTE = 1;	// NoteUnlistedRoot's symbol
 
 	const int NO_SESSION = -1;
 
@@ -570,6 +580,264 @@ namespace
 			return messages;
 		}
 	};
+
+	// ---- Use Instrument Hours (NinjaTrader v1.1.0) ----
+	// BEGIN INSTRUMENT HOURS. This block is the same in TatankaTpoProfile.cpp, TatankaSessionVolumeProfile.cpp
+	// and TatankaGapAnalysis.cpp, so the three studies read the same root and move to the same hours. Each
+	// DLL builds on its own, so each file keeps its own copy.
+
+	// The root from Sierra Chart's symbol (Sierra Chart has no root field): Upper, WithoutContract,
+	// ListedRoot, AliasRoot and RootOf are TatankaAmtToolkit.cpp 1.2.4's, word for word (the tests compare
+	// them with that file), so the AMT Toolkit and these studies read the same market from a symbol and
+	// run the same hours on it.
+
+	std::string Upper(const std::string& text)
+	{
+		std::string out = text;
+		for (char& c : out)
+			if (c >= 'a' && c <= 'z')
+				c = (char)(c - 'a' + 'A');
+		return out;
+	}
+
+	// A trailing futures month code and year ([FGHJKMNQUVXZ] + 1-4 digits) removed when something remains (GCZ26 -> GC,
+	// MESZ2026 -> MES, SR3H6 -> SR3).
+	std::string WithoutContract(const std::string& s)
+	{
+		size_t digits = 0;
+		while (digits < s.size() && digits < 4 && s[s.size() - 1 - digits] >= '0' && s[s.size() - 1 - digits] <= '9')
+			digits++;
+		if (digits >= 1 && s.size() >= digits + 2 && strchr("FGHJKMNQUVXZ", s[s.size() - 1 - digits]) != nullptr)
+			return s.substr(0, s.size() - 1 - digits);
+		return s;
+	}
+
+	// Whether the hours table (InstrumentHours, below) lists a root, so RootOf can tell another service's name for one
+	// of them.
+	bool ListedRoot(const std::string& root);
+
+	// NinjaTrader's root for one another data service writes its own way: CQG's names (EP, ENQ, TYA, TNA for the Ultra
+	// 10-Year..., CPE for copper, NQM for E-mini crude, the currencies' EU6... and MX6 for the peso), IQFeed's currencies (EU
+	// for Euro FX, PX for the peso) and the older CME codes some feeds keep (TY, US, FV, TU, EC, BP, JY, AD, CD, SF, NE, MP).
+	// Empty: none.
+	std::string AliasRoot(const std::string& root)
+	{
+		static const std::map<std::string, std::string> aliases = {
+			{"EP", "ES"}, {"ENQ", "NQ"}, {"TYA", "ZN"}, {"USA", "ZB"}, {"FVA", "ZF"}, {"TUA", "ZT"}, {"ULA", "UB"}, {"TNA", "TN"},	// CQG
+			{"CPE", "HG"}, {"NQM", "QM"},
+			{"EU6", "6E"}, {"BP6", "6B"}, {"JY6", "6J"}, {"DA6", "6A"}, {"CA6", "6C"}, {"SF6", "6S"}, {"NE6", "6N"}, {"MX6", "6M"},
+			{"EU", "6E"}, {"PX", "6M"},																			// IQFeed
+			{"TY", "ZN"}, {"US", "ZB"}, {"FV", "ZF"}, {"TU", "ZT"},												// older CME codes
+			{"EC", "6E"}, {"BP", "6B"}, {"JY", "6J"}, {"AD", "6A"}, {"CD", "6C"}, {"SF", "6S"}, {"NE", "6N"}, {"MP", "6M"}};
+		const auto found = aliases.find(root);
+		if (found != aliases.end())
+			return found->second;
+		// CQG's metals and energy end in E (GCE, CLE, SIE, MCLE); IQFeed's start with Q (QGC, QCL, QMGC).
+		if (root.size() >= 3 && root.back() == 'E' && ListedRoot(root.substr(0, root.size() - 1)))
+			return root.substr(0, root.size() - 1);
+		if (root.size() >= 3 && root[0] == 'Q' && ListedRoot(root.substr(1)))
+			return root.substr(1);
+		return std::string();
+	}
+
+	// The instrument root from Sierra Chart's symbol, as NinjaTrader names it (its master instrument name). Upper
+	// case, outer spaces trimmed, then:
+	// - a CQG symbol (F.<country>.<symbol>: F.US.GCEZ26) is read from the part after its second dot;
+	// - a leading @ or / (@ESZ26, /ESZ26) is dropped;
+	// - the symbol is cut at the first _ . - space # : or = (GCZ26_FUT_COMEX, GCZ6.COMEX, GCZ26-COMEX, ES#, CLX26 FUT);
+	// - a root of the hours table, as it stands or without its month code and year, is taken (SR3, GCZ6 -> GC);
+	// - else another service's name for one (AliasRoot: F.US.GCEZ26 -> GCE -> GC, F.US.EPZ26 -> ES, QGCZ26 -> GC, @EUZ26 -> 6E);
+	// - else the symbol without its month code and year (BTCZ26_FUT_CME -> BTC, which keeps ES's hours).
+	std::string RootOf(const std::string& symbol)
+	{
+		std::string s = Upper(symbol);
+		const size_t first = s.find_first_not_of(' ');
+		s = first == std::string::npos ? std::string() : s.substr(first, s.find_last_not_of(' ') - first + 1);
+		if (s.size() > 2 && s[0] == 'F' && s[1] == '.')
+		{
+			const size_t dot = s.find('.', 2);
+			bool letters = dot != std::string::npos && dot > 2 && dot <= 5;
+			for (size_t i = 2; letters && i < dot; i++)
+				letters = s[i] >= 'A' && s[i] <= 'Z';
+			if (letters)
+				s = s.substr(dot + 1);
+		}
+		if (!s.empty() && (s[0] == '@' || s[0] == '/'))
+			s = s.substr(1);
+		const size_t cut = s.find_first_of("_.- #:=");
+		if (cut != std::string::npos)
+			s = s.substr(0, cut);
+		const std::string bare = WithoutContract(s);
+		for (const std::string& candidate : {s, bare})
+		{
+			if (ListedRoot(candidate))
+				return candidate;
+			const std::string alias = AliasRoot(candidate);
+			if (!alias.empty())
+				return alias;
+		}
+		return bare;
+	}
+
+	// A market's regular hours in Chicago time, by root, micros with their parent's: the AMT Toolkit's
+	// table (NinjaTrader v1.2.4), which NinjaTrader's TPO Profile, Session Volume Profile and Gap Analysis
+	// copy. The session times are written for ES's regular hours (08:30-15:00 CT); Use Instrument Hours
+	// moves them to the chart's market. A root not listed has ES's hours: nothing moves.
+	struct InstrumentHours
+	{
+		static constexpr int EsOpen		= 8 * 60 + 30;
+		static constexpr int EsClose	= 15 * 60;
+
+		int	Open	= EsOpen;	// minutes of the day, Chicago time
+		int	Close	= EsClose;
+
+		bool IsEs() const { return Open == EsOpen && Close == EsClose; }
+
+		struct Entry { const char* Root; int Open; int Close; };
+
+		// The table's entry for a root, nullptr if it has none.
+		static const Entry* Find(const std::string& root)
+		{
+			static const Entry table[] =
+			{
+				{"ES", 510, 900}, {"MES", 510, 900}, {"NQ", 510, 900}, {"MNQ", 510, 900}, {"RTY", 510, 900},	// equity index 08:30-15:00
+				{"M2K", 510, 900}, {"YM", 510, 900}, {"MYM", 510, 900}, {"EMD", 510, 900}, {"NKD", 510, 900},
+				{"CL", 480, 810}, {"MCL", 480, 810}, {"QM", 480, 810}, {"NG", 480, 810}, {"RB", 480, 810},		// energy 08:00-13:30
+				{"HO", 480, 810},
+				{"GC", 440, 750}, {"MGC", 440, 750},															// metals 07:20-12:30
+				{"SI", 445, 745}, {"SIL", 445, 745},															// 07:25-12:25
+				{"HG", 430, 720}, {"MHG", 430, 720},															// 07:10-12:00
+				{"PL", 440, 725},																				// 07:20-12:05
+				{"PA", 450, 720},																				// 07:30-12:00
+				{"ZT", 440, 840}, {"ZF", 440, 840}, {"ZN", 440, 840}, {"TN", 440, 840}, {"ZB", 440, 840},		// interest rates 07:20-14:00
+				{"UB", 440, 840}, {"SR3", 440, 840},
+				{"6E", 440, 840}, {"M6E", 440, 840}, {"6B", 440, 840}, {"6J", 440, 840}, {"6A", 440, 840},		// currencies 07:20-14:00
+				{"6C", 440, 840}, {"6S", 440, 840}, {"6N", 440, 840}, {"6M", 440, 840},
+			};
+			for (const Entry& e : table)
+				if (root == e.Root)
+					return &e;
+			return nullptr;
+		}
+
+		static InstrumentHours Of(const std::string& root)
+		{
+			InstrumentHours h;
+			if (const Entry* e = Find(root))
+			{
+				h.Open	= e->Open;
+				h.Close	= e->Close;
+			}
+			return h;
+		}
+
+		// Whether the table lists a root (one with ES's own hours included).
+		static bool Listed(const std::string& root) { return Find(root) != nullptr; }
+
+		static int Mod(int m) { return (m % 1440 + 1440) % 1440; }
+
+		// A CT time (minutes of the day) written for ES's hours, at the same place in this market's
+		// open-close: one nearer the open moves with the open, one nearer the close with the close (a
+		// tie goes with the open); the overnight (before 07:00, from 16:00) stays.
+		int Move(int m) const
+		{
+			if (m < 7 * 60 || m >= 16 * 60)
+				return m;
+			return m + (std::abs(m - EsOpen) <= std::abs(m - EsClose) ? Open - EsOpen : Close - EsClose);
+		}
+
+		// A window's start and end (CT minutes) moved as a whole: each end on its own, unless that
+		// changes the window's order. Two ends either side of 11:45 that would land on the same minute
+		// or past each other (11:00-12:00: 10:30-10:30 on CL, 09:50-09:30 on GC) both move as the
+		// window's middle does, keeping its length (CL 10:30-11:30, GC 09:50-10:50).
+		void MoveWindow(int& a, int& b) const
+		{
+			const int x = Move(a), y = Move(b);
+			if (a == b || ((a < b) == (x < y) && x != y))
+			{
+				a = x;
+				b = y;
+				return;
+			}
+			const int mid = (a + Mod(b - a) / 2) % 1440, d = Move(mid) - mid;
+			a = Mod(a + d);
+			b = Mod(b + d);
+		}
+	};
+
+	bool ListedRoot(const std::string& root)
+	{
+		return InstrumentHours::Listed(root);
+	}
+
+	// Sierra Chart only. A root the table doesn't list (a market NinjaTrader's table leaves out, such as
+	// BTC, or a symbol form RootOf can't read) keeps ES's hours, as on NinjaTrader for a market it
+	// doesn't list. So the setting says so in the Message Log, once per symbol. The note for a symbol:
+	// empty when the table lists its root, or there is no symbol.
+	std::string UnlistedRootNote(const std::string& study, const std::string& symbol)
+	{
+		const std::string root = RootOf(symbol);
+		if (symbol.empty() || InstrumentHours::Listed(root))
+			return std::string();
+		return study + ": Use Instrument Hours does not know the market of " + symbol + " (read as " + root
+			+ "), so the times run as typed, at ES's regular hours. Symbols such as GCZ26_FUT_COMEX, GCZ6.COMEX,"
+			" F.US.GCEZ26 (CQG), QGC# and @GC# (IQFeed) are read. For another market, type its hours and turn the setting"
+			" off.";
+	}
+
+	// Writes the note while the setting is on, once per symbol. noted: a persistent int holding the
+	// hash of the symbol last noted (0: none), so a symbol is noted again after a listed one or after
+	// the setting was off.
+	void NoteUnlistedRoot(SCStudyInterfaceRef sc, const char* study, bool useHours, int& noted)
+	{
+		const std::string symbol	= sc.Symbol.GetChars();
+		const std::string note		= useHours ? UnlistedRootNote(study, symbol) : std::string();
+		if (note.empty())
+		{
+			noted = 0;
+			return;
+		}
+		uint32_t hash = 2166136261u;
+		for (const char ch : symbol)
+			hash = (hash ^ (uint8_t)ch) * 16777619u;
+		const int key = (int)(hash | 1u);
+		if (key != noted)
+			sc.AddMessageToLog(note.c_str(), 0);
+		noted = key;
+	}
+	// END INSTRUMENT HOURS
+
+	// HH:mm of seconds since midnight (NinjaTrader's Clock of an HHmmss time).
+	std::string ClockText(int seconds)
+	{
+		char text[8];
+		snprintf(text, sizeof(text), "%02d:%02d", seconds / 3600 % 24, seconds / 60 % 60);
+		return text;
+	}
+
+	// Use Instrument Hours (NinjaTrader v1.1.0, InstrumentHours.Apply): the RTH start and end (seconds
+	// since midnight, Chicago time, valid and different) at the root's own regular hours, each moved on its
+	// own, the seconds kept. Returns "" and sets start and end, or says why they make no session there:
+	// two times that land on the same time or past each other (11:00-12:00 is 10:30-10:30 on CL, and
+	// 09:50-09:30 on GC, a session through the night). A root with ES's hours keeps them as they are.
+	std::string ApplyInstrumentHours(int rthStart, int rthEnd, const std::string& root, int& start, int& end)
+	{
+		const InstrumentHours h = InstrumentHours::Of(root);
+		start	= rthStart;
+		end		= rthEnd;
+		if (h.IsEs())
+			return "";
+		const int a = h.Move(rthStart / 60) * 60 + rthStart % 60;
+		const int b = h.Move(rthEnd / 60) * 60 + rthEnd % 60;
+		const std::string why = a == b ? "the start and end to the same time"
+			: (a < b) != (rthStart < rthEnd) ? "the start and end past each other (" + ClockText(a) + "-" + ClockText(b) + ")" : "";
+		if (!why.empty())
+			return "RTH " + ClockText(rthStart) + "-" + ClockText(rthEnd) + " is no session on " + root + ": its regular hours ("
+				+ ClockText(h.Open * 60) + "-" + ClockText(h.Close * 60) + " CT) move " + why + ". Enter other times, or turn Use Instrument Hours off.";
+		start	= a;
+		end		= b;
+		return "";
+	}
 
 	bool SupportedBars(int chartDataType, int intradayBarPeriodType, int secondsPerBar)
 	{
@@ -1642,8 +1910,9 @@ SCSFExport scsf_TatankaGapAnalysis(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName		= "Tatanka Gap Analysis";
-		sc.StudyDescription	= "Tatanka Gap Analysis v1.0.0: RTH opening gaps with partial fills, optional right extension, "
-							  "and all loaded chart history. Use Minute or Second bars. Free and open source (MPL 2.0). tatankatrading.com";
+		sc.StudyDescription	= "Tatanka Gap Analysis v1.1.0: RTH opening gaps with partial fills, optional right extension, "
+							  "and all loaded chart history. Each market uses its own regular hours (Use Instrument Hours). "
+							  "Use Minute or Second bars. Free and open source (MPL 2.0). tatankatrading.com";
 		sc.GraphRegion		= 0;
 		sc.AutoLoop			= 0;
 		sc.ValueFormat		= VALUEFORMAT_INHERITED;
@@ -1661,6 +1930,12 @@ SCSFExport scsf_TatankaGapAnalysis(SCStudyInterfaceRef sc)
 		sc.Input[IN_RTH_END].Name = "RTH end (Chicago)";
 		sc.Input[IN_RTH_END].SetTime(54000);
 		sc.Input[IN_RTH_END].SetDescription("Default 15:00:00. Reference price is the last loaded RTH chart-bar close.");
+
+		sc.Input[IN_USE_HOURS].Name = "Use Instrument Hours";
+		sc.Input[IN_USE_HOURS].SetYesNo(1);
+		sc.Input[IN_USE_HOURS].SetDescription("RTH start and end are written for ES's regular hours (08:30-15:00 CT). On another market they "
+			"move to its own (GC 07:20-12:30, CL 08:00-13:30): a time nearer the open moves with the open, one nearer the close with the "
+			"close. Off: as typed on every market.");
 
 		sc.Input[IN_MIN_GAP].Name = "Minimum gap size (points)";
 		sc.Input[IN_MIN_GAP].SetDouble(0);
@@ -1756,6 +2031,14 @@ SCSFExport scsf_TatankaGapAnalysis(SCStudyInterfaceRef sc)
 		sc.Input[IN_ALERT_SOUND_FILE].SetDescription("Optional. A WAV file in Sierra Chart's AlertSounds folder, or a full path. "
 			"Plays instead of the Alert sound. Blank uses the Alert sound.");
 
+		// Shown in NinjaTrader's order: Use Instrument Hours after RTH end.
+		for (int i = 0, order = 1; i < IN_USE_HOURS; i++)
+		{
+			sc.Input[i].DisplayOrder = (uint16_t)order++;
+			if (i == IN_RTH_END)
+				sc.Input[IN_USE_HOURS].DisplayOrder = (uint16_t)order++;
+		}
+
 		return;
 	}
 
@@ -1783,12 +2066,19 @@ SCSFExport scsf_TatankaGapAnalysis(SCStudyInterfaceRef sc)
 		return;
 	}
 
-	const int rthStart	= sc.Input[IN_RTH_START].GetTime();
-	const int rthEnd	= sc.Input[IN_RTH_END].GetTime();
+	const int typedStart	= sc.Input[IN_RTH_START].GetTime();
+	const int typedEnd		= sc.Input[IN_RTH_END].GetTime();
 	n_ACSIL::s_BarPeriod barPeriod;
 	sc.GetBarPeriodParameters(barPeriod);
-	state.Error = ConfigError(rthStart, rthEnd,
+	state.Error = ConfigError(typedStart, typedEnd,
 		SupportedBars(barPeriod.ChartDataType, barPeriod.IntradayChartBarPeriodType, sc.SecondsPerBar));
+	// Use Instrument Hours (NinjaTrader v1.1.0): the RTH times at the chart's market's own regular hours,
+	// or why they make no session there. The root is read from the symbol as the AMT Toolkit reads it;
+	// a symbol whose market the table doesn't list gets a note in the Message Log (Sierra Chart only).
+	NoteUnlistedRoot(sc, "Tatanka Gap Analysis", sc.Input[IN_USE_HOURS].GetYesNo() != 0, sc.GetPersistentInt(PI_HOURS_NOTE));
+	int rthStart = typedStart, rthEnd = typedEnd;
+	if (state.Error.empty() && sc.Input[IN_USE_HOURS].GetYesNo())
+		state.Error = ApplyInstrumentHours(typedStart, typedEnd, RootOf(sc.Symbol.GetChars()), rthStart, rthEnd);
 	if (!state.Error.empty())
 	{
 		state.ResetEngine();

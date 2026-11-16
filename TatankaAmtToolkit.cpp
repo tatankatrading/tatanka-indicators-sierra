@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tatanka Trading LLC.
 // This Source Code Form is subject to the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, obtain one at https://mozilla.org/MPL/2.0/.
-// Tatanka AMT Toolkit v1.0.0 for Sierra Chart - tatankatrading.com
+// Tatanka AMT Toolkit v1.2.4 for Sierra Chart - tatankatrading.com
 // Sierra Chart port of the NinjaTrader 8 "Tatanka AMT Toolkit" (chart label "Tatanka AMT").
 //
 // The whole toolkit, built in four stages (amt_parity_spec.md section 0.4). Stage 1: the developing
@@ -9,7 +9,7 @@
 // and the walls; the prior day's value (pdPOC/pdVAH/pdVAL); the prior month's value (pmPOC/pmVAH/pmVAL); the RTH VWAP; the
 // daily ATR; the dashboard frame; price-scale tags; Force on Top; Hide All Labels; the session-time
 // warning; the alert pipeline. Stage 2 (the auction read): the overnight high/low; the previous
-// day's high/low/open with the 15:00 roll and its history; the initial balance; the settlement and
+// day's high/low/open switching at the session's close and its history; the initial balance; the settlement and
 // the overnight inventory with trap detection; the RTH open, the open location and the gap test; the
 // Dalton day type; the 80% Rule and its fill; the late spike; the dashboard's DAY TYPE, OVN
 // INVENTORY, OPEN and 80% RULE rows; their tags and alerts. Stage 3 (unfinished business): the
@@ -22,7 +22,25 @@
 // last-good cache, a re-read every 5 s while live, the STALE and wrong-symbol checks); the levels'
 // lines, zones (translucent ranges), flips and labels; the dashboard's PIVOT row; the level alerts
 // (Cross, Zone Entry, Both); and the optional Discord webhook (sc.MakeHTTPPOSTRequest, live alerts
-// only). Every input and subgraph has the index Stage 1 gave it.
+// only). Every input and subgraph has the index Stage 1 gave it. NinjaTrader 1.1.0: the levels file input
+// also takes a levels link (LevelLink: one download per link for every chart, asked on NinjaTrader's
+// schedule around the 8:15 and 16:45 CT publishes while trades arrive, by sc.MakeHTTPRequest; the last good
+// levels stay when the link can't be reached). NinjaTrader 1.2.0-1.2.2: the prior day's value and its drawn
+// profile from every trade of the RTH session at one-tick rows (Value From Ticks), the current Session or
+// Weekly profile from its trades (Profile From Ticks), both read from the chart's own intraday file
+// (TickStore) where NinjaTrader downloads ticks, with 1-minute bars where trades are missing; late trades
+// restart today's 80% Rule; every pd line switches to the closed session at its close; and NinjaTrader's
+// nine 1.2.2 fixes (OVN INVENTORY at the last overnight bar, the prior month's value from its minutes,
+// alerts only for lines drawn, poor highs/lows at the session's extremes, the IB and OVN read with their
+// lines off, value and nPOC rows on the profile's, level zones on the Daily ATR Period, a later RTH Session
+// for VA deciding OPEN, the gap test and the 80% Rule together). NinjaTrader 1.2.3: a Session
+// profile loaded over a weekend or a holiday takes the trades of the window it shows (the last one with
+// trading in it, Friday's on Monday morning); Calc Precision again for every Session and Weekly bar without
+// trades; a Session Time through midnight (1700-1600) is one profile from its start; the day type waits for
+// today's IB, whatever IB Calc Period is set (the overnight range until it is complete). NinjaTrader 1.2.4 (this
+// version): Use Instrument Hours (InstrumentHours, on by default) moves the session fields, the RTH VWAP window, the
+// end of the overnight count, the regular hours (the settle, the RTH open, the day type) and the TPO periods to each
+// market's own regular hours (GC 07:20-12:30, CL 08:00-13:30, ...), by the root RootOf reads from the symbol.
 //
 // The engine below (Profile, DailyHistory, Engine.Process, BuildVisuals, the alert tracker) is
 // NinjaTrader's (TatankaAmtToolkit.cs, namespace TatankaTrading.AmtToolkit) statement for statement,
@@ -37,7 +55,10 @@
 // Data: the chart's bars; 1-minute bars from the chart itself on a 1-minute chart, otherwise from a
 // hidden 1-minute chart of the same symbol (the one Periodic and Auto Anchored VP use); 30-minute bars
 // for the prior month built from those minutes; daily bars from the hidden daily chart that TPO
-// Profile and If/Then share. A chart bar is committed to the engine once, when the minutes have
+// Profile and If/Then share; the trades from the chart's intraday file records (Intraday Data Storage
+// Time Unit 1 Tick: their time base, chart time or UTC, told from the chart's bars; read before the engine
+// is built for at most as long as NinjaTrader's load waits for its downloads, then on as they come). A
+// chart bar is committed to the engine once, when the minutes have
 // moved past its end; the forming bar is previewed on a copy of the engine on every study call
 // (NinjaTrader's commit / preview).
 
@@ -69,7 +90,7 @@ namespace
 	// ---- Brand (NinjaTrader's AmtBrand, NT:36-42) ----
 
 	const char* const BRAND_SHORT	= "Tatanka AMT";
-	const char* const BRAND_VERSION	= "1.0.0";
+	const char* const BRAND_VERSION	= "1.2.4";
 	const char* const BRAND_SITE	= "tatankatrading.com";
 
 	// ---- Palette (NinjaTrader's AmtPalette, NT:46-54): ARGB, TradingView's named colors ----
@@ -224,7 +245,11 @@ namespace
 		IN_ALERT_SOUND,
 		IN_DISCORD_ENABLE,			// 125 19. Discord (Stage 4)
 		IN_DISCORD_URL,
-		IN_COUNT					// 127; Sierra Chart's 128th input is kept spare
+		IN_PD_TICK_SESSIONS,		// 127 4. Prev Value (NinjaTrader 1.2.0): Sierra Chart's 128th input
+		IN_PROFILE_TICKS,			// 128 11. Profile (NinjaTrader 1.2.2): Sierra Chart's 160 inputs (SC_INPUTS_AVAILABLE); an older
+									// Sierra Chart with 128 has no such input and keeps NinjaTrader's default (on)
+		IN_INST_HOURS,				// 129 1. Global (NinjaTrader 1.2.4): as input 128, none on a Sierra Chart with 128 inputs (on)
+		IN_COUNT					// 130
 	};
 
 	// ---- Subgraphs (spec A.3): one per drawn line kind, named with NinjaTrader's name. Final. ----
@@ -291,7 +316,9 @@ namespace
 		PI_EDIT_MENU_ID		= 3,	// Stage 4
 		PI_PASTE_MENU_ID	= 4,	// Stage 4
 		PI_ERROR_LOGGED		= 5,
-		PI_NO_CHART_LOGGED	= 6
+		PI_NO_CHART_LOGGED	= 6,
+		PI_TICKS_LOGGED		= 7,	// 1.2.0: the tick data's messages, once each (bits 1, 2, 4, 8)
+		PI_HOURS_LOGGED		= 8		// 1.2.4: the instrument hours' message, once per text
 	};
 
 	// NinjaTrader Limits (group 20, NT:3513-3518) as constants (spec A.4).
@@ -320,6 +347,26 @@ namespace
 	const char* const TEXT_SESSION_WARNING	= "Session fields differ from defaults. All session fields are Central exchange time.";
 	const char* const TEXT_NO_MINUTES	= " One-minute data unavailable; using chart-bar profile fallback.";
 	const char* const TEXT_NO_MINUTE_CHART_LOG = "Tatanka AMT: Sierra Chart could not open a 1-minute chart of this symbol; profiles use the chart's bars.";
+	// 1.2.0-1.2.3: the value and the profile from ticks (spec H.3), logged once.
+	const char* const TEXT_TICKS_STORAGE_LOG = "Tatanka AMT: the prior day's value and the profile from ticks need tick by tick data: set Intraday Data "
+		"Storage Time Unit to 1 Tick (Global Settings >> Data/Trade Service Settings) and download tick history. Until then they use 1-minute bars.";
+	const char* const TEXT_TICKS_TIME_LOG = "Tatanka AMT: the chart's tick data does not match its bars, so the prior day's value and the profile use "
+		"1-minute bars.";
+	const char* const TEXT_TICKS_WAIT_LOG = "Tatanka AMT: the tick data took longer to read than the load waits (2 minutes at most, as in NinjaTrader). "
+		"The chart is drawn now and uses 1-minute bars where trades are not read yet. The prior day's value switches to its trades once they are read.";
+	const char* const TEXT_TICKS_UNREADABLE_LOG = "Tatanka AMT: Sierra Chart could not read a record of the chart's tick data, so it was left out. "
+		"A minute missing its trade uses its 1-minute bar.";
+
+	// The load's wait for the tick file (NinjaTrader 1.2.0-1.2.3's tickWaitUntil and periodWaitUntil): 60 s for the
+	// sessions, 120 s when the current profile's trades are asked for too.
+	const uint64_t TICKS_WAIT_SESSIONS_MS	= 60000;
+	const uint64_t TICKS_WAIT_PERIOD_MS		= 120000;
+	// A record that fails to read on this many calls in a row is left out (TickStore::Read).
+	const int TICKS_READ_TRIES				= 3;
+	// The records' time base when both fit (Session VP's CalibrateRecords): completed bars to compare, and the most
+	// records a bar's volume is added up from.
+	const int EVIDENCE_BARS					= 4;
+	const int64_t EVIDENCE_MAX_RECORDS		= 5000;
 
 	// ---- Choice lists (NinjaTrader's TatankaAmtToolkitOptions, NT:3520-3567, in their order) ----
 
@@ -829,26 +876,82 @@ namespace
 		return close > 1000 && tick < .1 ? .25 : tick;
 	}
 
-	// The instrument root from Sierra Chart's symbol (spec B.0.2, SIERRA: Sierra Chart has no root
-	// field): upper case, cut at the first _ . - space or #, then a trailing futures month code and
-	// year ([FGHJKMNQUVXZ] + 1-4 digits) removed when something remains. ESZ26_FUT_CME -> ES,
-	// ESZ6.CME -> ES, MESZ2026 -> MES, 6EZ26-CME -> 6E, ES# -> ES.
-	std::string RootOf(const std::string& symbol)
+	// A trailing futures month code and year ([FGHJKMNQUVXZ] + 1-4 digits) removed when something remains (GCZ26 -> GC,
+	// MESZ2026 -> MES, SR3H6 -> SR3).
+	std::string WithoutContract(const std::string& s)
 	{
-		std::string s = Upper(symbol);
-		const size_t cut = s.find_first_of("_.- #");
-		if (cut != std::string::npos)
-			s = s.substr(0, cut);
 		size_t digits = 0;
 		while (digits < s.size() && digits < 4 && s[s.size() - 1 - digits] >= '0' && s[s.size() - 1 - digits] <= '9')
 			digits++;
-		if (digits >= 1 && s.size() >= digits + 2)
-		{
-			const char month = s[s.size() - 1 - digits];
-			if (strchr("FGHJKMNQUVXZ", month) != nullptr)
-				s = s.substr(0, s.size() - 1 - digits);
-		}
+		if (digits >= 1 && s.size() >= digits + 2 && strchr("FGHJKMNQUVXZ", s[s.size() - 1 - digits]) != nullptr)
+			return s.substr(0, s.size() - 1 - digits);
 		return s;
+	}
+
+	// Roots NinjaTrader's instrument hours list (1.2.4), so RootOf can tell another service's name for one of them.
+	bool ListedRoot(const std::string& root);
+
+	// NinjaTrader's root for one another data service writes its own way: CQG's names (EP, ENQ, TYA, TNA for the Ultra
+	// 10-Year..., CPE for copper, NQM for E-mini crude, the currencies' EU6... and MX6 for the peso), IQFeed's currencies (EU
+	// for Euro FX, PX for the peso) and the older CME codes some feeds keep (TY, US, FV, TU, EC, BP, JY, AD, CD, SF, NE, MP).
+	// Empty: none.
+	std::string AliasRoot(const std::string& root)
+	{
+		static const std::map<std::string, std::string> aliases = {
+			{"EP", "ES"}, {"ENQ", "NQ"}, {"TYA", "ZN"}, {"USA", "ZB"}, {"FVA", "ZF"}, {"TUA", "ZT"}, {"ULA", "UB"}, {"TNA", "TN"},	// CQG
+			{"CPE", "HG"}, {"NQM", "QM"},
+			{"EU6", "6E"}, {"BP6", "6B"}, {"JY6", "6J"}, {"DA6", "6A"}, {"CA6", "6C"}, {"SF6", "6S"}, {"NE6", "6N"}, {"MX6", "6M"},
+			{"EU", "6E"}, {"PX", "6M"},																			// IQFeed
+			{"TY", "ZN"}, {"US", "ZB"}, {"FV", "ZF"}, {"TU", "ZT"},												// older CME codes
+			{"EC", "6E"}, {"BP", "6B"}, {"JY", "6J"}, {"AD", "6A"}, {"CD", "6C"}, {"SF", "6S"}, {"NE", "6N"}, {"MP", "6M"}};
+		const auto found = aliases.find(root);
+		if (found != aliases.end())
+			return found->second;
+		// CQG's metals and energy end in E (GCE, CLE, SIE, MCLE); IQFeed's start with Q (QGC, QCL, QMGC).
+		if (root.size() >= 3 && root.back() == 'E' && ListedRoot(root.substr(0, root.size() - 1)))
+			return root.substr(0, root.size() - 1);
+		if (root.size() >= 3 && root[0] == 'Q' && ListedRoot(root.substr(1)))
+			return root.substr(1);
+		return std::string();
+	}
+
+	// The instrument root from Sierra Chart's symbol, as NinjaTrader names it (its master instrument name; spec B.0.2,
+	// SIERRA: Sierra Chart has no root field). Upper case, outer spaces trimmed, then:
+	// - a CQG symbol (F.<country>.<symbol>: F.US.GCEZ26) is read from the part after its second dot;
+	// - a leading @ or / (@ESZ26, /ESZ26) is dropped;
+	// - the symbol is cut at the first _ . - space # : or = (GCZ26_FUT_COMEX, GCZ6.COMEX, GCZ26-COMEX, ES#, CLX26 FUT);
+	// - a root of NinjaTrader's hours table, as it stands or without its month code and year, is taken (SR3, GCZ6 -> GC);
+	// - else another service's name for one (AliasRoot: F.US.GCEZ26 -> GCE -> GC, F.US.EPZ26 -> ES, QGCZ26 -> GC, @EUZ26 -> 6E);
+	// - else the symbol without its month code and year, as before (BTCZ26_FUT_CME -> BTC, which keeps ES's hours).
+	std::string RootOf(const std::string& symbol)
+	{
+		std::string s = Upper(symbol);
+		const size_t first = s.find_first_not_of(' ');
+		s = first == std::string::npos ? std::string() : s.substr(first, s.find_last_not_of(' ') - first + 1);
+		if (s.size() > 2 && s[0] == 'F' && s[1] == '.')
+		{
+			const size_t dot = s.find('.', 2);
+			bool letters = dot != std::string::npos && dot > 2 && dot <= 5;
+			for (size_t i = 2; letters && i < dot; i++)
+				letters = s[i] >= 'A' && s[i] <= 'Z';
+			if (letters)
+				s = s.substr(dot + 1);
+		}
+		if (!s.empty() && (s[0] == '@' || s[0] == '/'))
+			s = s.substr(1);
+		const size_t cut = s.find_first_of("_.- #:=");
+		if (cut != std::string::npos)
+			s = s.substr(0, cut);
+		const std::string bare = WithoutContract(s);
+		for (const std::string& candidate : {s, bare})
+		{
+			if (ListedRoot(candidate))
+				return candidate;
+			const std::string alias = AliasRoot(candidate);
+			if (!alias.empty())
+				return alias;
+		}
+		return bare;
 	}
 
 	// ---- Engine data (NT:340-345, NT:428-522) ----
@@ -878,6 +981,9 @@ namespace
 		double Total	= 0;
 	};
 
+	// Trades by price (NinjaTrader's List<KeyValuePair<double, double>>: each traded price and its volume).
+	using PriceVolumes = std::vector<std::pair<double, double>>;
+
 	// NinjaTrader's Profile (NT:432-470): volume per row key (Bin of the price), the keys in
 	// first-insertion order, the oldest evicted at the row limit.
 	struct Profile
@@ -890,6 +996,56 @@ namespace
 
 		Profile() = default;
 		Profile(double step, int limit) : Step(step), Limit((std::max)(1, limit)) {}
+
+		// The prices in NinjaTrader's OrderBy(x => x.Key) order (a stable sort).
+		static PriceVolumes ByPrice(const PriceVolumes& prices)
+		{
+			PriceVolumes sorted = prices;
+			std::stable_sort(sorted.begin(), sorted.end(), [](const std::pair<double, double>& a, const std::pair<double, double>& b) { return a.first < b.first; });
+			return sorted;
+		}
+
+		// A tick volume profile: each traded price's volume in its own row at `step`, lowest price first
+		// (NinjaTrader 1.2.0's Profile.FromPrices). Like NinjaTrader's, it never prunes.
+		static Profile FromPrices(double step, const PriceVolumes& prices, int limit = 1)
+		{
+			Profile p(step, limit);
+			for (const auto& x : ByPrice(prices))
+			{
+				const int64_t k = Bin(x.first, step);
+				auto found = p.Rows.find(k);
+				if (found == p.Rows.end())
+				{
+					p.Insertion.push_back(k);
+					found = p.Rows.emplace(k, 0.0).first;
+				}
+				found->second = found->second + x.second;
+			}
+			return p;
+		}
+
+		// A minute's trades: each price's volume in its row (a tick volume profile, one minute at a time;
+		// NinjaTrader 1.2.2's AddPrices), the oldest rows evicted at the row limit as Add does.
+		void AddPrices(const PriceVolumes& prices)
+		{
+			for (const auto& x : ByPrice(prices))
+			{
+				const int64_t k = Bin(x.first, Step);
+				auto found = Rows.find(k);
+				if (found == Rows.end())
+				{
+					while ((int64_t)Rows.size() >= Limit)
+					{
+						Rows.erase(Insertion.front());
+						Insertion.pop_front();
+						PrunedRows++;
+					}
+					Insertion.push_back(k);
+					found = Rows.emplace(k, 0.0).first;
+				}
+				found->second = found->second + x.second;
+			}
+		}
 
 		// Upper-exclusive (the top bin gets nothing unless the bar is one bin), at most the lowest 200
 		// rows of a wider bar when capped (both originals, KEPT).
@@ -2000,6 +2156,48 @@ namespace
 		return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 	}
 
+	// StreamReader(stream, Encoding.UTF8, true)'s text of these bytes: UTF-8, or the encoding of a byte order mark
+	// (UTF-16 or UTF-32, either byte order). The levels file's (ReadLimited) and the levels link's (LevelLink.ReadReply).
+	Text16 DecodeText(const std::string& bytes)
+	{
+		Text16 decoded;
+		const unsigned char* b = (const unsigned char*)bytes.data();
+		const size_t n = bytes.size();
+		auto utf16 = [&decoded, b, n](size_t from, bool big)
+		{
+			for (size_t i = from; i + 1 < n; i += 2)
+				decoded += (wchar_t)(big ? (b[i] << 8) | b[i + 1] : b[i] | (b[i + 1] << 8));
+			if ((n - from) % 2 != 0)
+				decoded += (wchar_t)0xFFFD;
+		};
+		auto utf32 = [&decoded, b, n](size_t from, bool big)
+		{
+			for (size_t i = from; i + 3 < n; i += 4)
+			{
+				const uint32_t c = big ? ((uint32_t)b[i] << 24) | ((uint32_t)b[i + 1] << 16) | ((uint32_t)b[i + 2] << 8) | b[i + 3]
+					: b[i] | ((uint32_t)b[i + 1] << 8) | ((uint32_t)b[i + 2] << 16) | ((uint32_t)b[i + 3] << 24);
+				if (c >= 0x10000 && c <= 0x10FFFF)
+				{
+					decoded += (wchar_t)(0xD800 + ((c - 0x10000) >> 10));
+					decoded += (wchar_t)(0xDC00 + ((c - 0x10000) & 0x3FF));
+				}
+				else
+					decoded += (wchar_t)(c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF) ? 0xFFFD : c);
+			}
+		};
+		if (n >= 4 && b[0] == 0xFF && b[1] == 0xFE && b[2] == 0 && b[3] == 0)
+			utf32(4, false);
+		else if (n >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 0xFE && b[3] == 0xFF)
+			utf32(4, true);
+		else if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE)
+			utf16(2, false);
+		else if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF)
+			utf16(2, true);
+		else
+			decoded = Utf16Of(n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF ? bytes.substr(3) : bytes);
+		return decoded;
+	}
+
 	// NinjaTrader's ReadLimited (NT:1285-1303): shared read, at most 1 MB, UTF-8 or the encoding of a byte
 	// order mark (StreamReader's detection). False with .NET's message.
 	bool ReadLimited(const std::string& path, std::string& text, std::string& error)
@@ -2047,41 +2245,7 @@ namespace
 			error = IoErrorMessage(readError, path);
 			return false;
 		}
-		Text16 decoded;
-		const unsigned char* b = (const unsigned char*)bytes.data();
-		const size_t n = bytes.size();
-		auto utf16 = [&decoded, b, n](size_t from, bool big)
-		{
-			for (size_t i = from; i + 1 < n; i += 2)
-				decoded += (wchar_t)(big ? (b[i] << 8) | b[i + 1] : b[i] | (b[i + 1] << 8));
-			if ((n - from) % 2 != 0)
-				decoded += (wchar_t)0xFFFD;
-		};
-		auto utf32 = [&decoded, b, n](size_t from, bool big)
-		{
-			for (size_t i = from; i + 3 < n; i += 4)
-			{
-				const uint32_t c = big ? ((uint32_t)b[i] << 24) | ((uint32_t)b[i + 1] << 16) | ((uint32_t)b[i + 2] << 8) | b[i + 3]
-					: b[i] | ((uint32_t)b[i + 1] << 8) | ((uint32_t)b[i + 2] << 16) | ((uint32_t)b[i + 3] << 24);
-				if (c >= 0x10000 && c <= 0x10FFFF)
-				{
-					decoded += (wchar_t)(0xD800 + ((c - 0x10000) >> 10));
-					decoded += (wchar_t)(0xDC00 + ((c - 0x10000) & 0x3FF));
-				}
-				else
-					decoded += (wchar_t)(c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF) ? 0xFFFD : c);
-			}
-		};
-		if (n >= 4 && b[0] == 0xFF && b[1] == 0xFE && b[2] == 0 && b[3] == 0)
-			utf32(4, false);
-		else if (n >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 0xFE && b[3] == 0xFF)
-			utf32(4, true);
-		else if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE)
-			utf16(2, false);
-		else if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF)
-			utf16(2, true);
-		else
-			decoded = Utf16Of(n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF ? bytes.substr(3) : bytes);
+		const Text16 decoded = DecodeText(bytes);
 		if (decoded.size() > 1048576)
 		{
 			error = tooLarge;
@@ -2097,9 +2261,600 @@ namespace
 		return (int64_t)(fileTime / 10000000ull) - 11644473600LL + (int64_t)SIERRA_UNIX_DATE * SECONDS_DAY;
 	}
 
-	// NinjaTrader's last-good levels source (NT:1242-1356): the file named by the template (or the paste
-	// box), the last valid document, its revision, and the notices. Each instance is NinjaTrader's one
-	// LevelFileSource of a chart load.
+	// The computer's clock: UTC seconds since Sierra Chart's base date (NinjaTrader's DateTime.UtcNow).
+	int64_t SystemUtcSeconds()
+	{
+		FILETIME now;
+		GetSystemTimeAsFileTime(&now);
+		return UtcSecondsOf(((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime);
+	}
+
+	// ---- The levels link (NinjaTrader 1.1.0's LevelLink) ----
+
+	// .NET's regular-expression word character (\b's test): letters, nonspacing marks, decimal digits, connector
+	// punctuation, ZWJ and ZWNJ. Exact for ASCII; other characters by Windows' character types (close to .NET's
+	// Unicode categories, not measured).
+	bool IsWordNet(wchar_t c)
+	{
+		if (c < 0x80)
+			return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'_';
+		if (c == 0x200C || c == 0x200D || c == 0x203F || c == 0x2040 || c == 0x2054 || c == 0xFE33 || c == 0xFE34 || (c >= 0xFE4D && c <= 0xFE4F) || c == 0xFF3F
+			|| IsDigitNet(c))
+			return true;
+		WORD type1 = 0, type3 = 0;
+		GetStringTypeW(CT_CTYPE1, &c, 1, &type1);
+		GetStringTypeW(CT_CTYPE3, &c, 1, &type3);
+		return (type1 & C1_ALPHA) != 0 || (type3 & C3_NONSPACING) != 0;
+	}
+
+	// A levels link (https://.../l/<key>/{root}.txt from /connect in the Tatanka Discord). One download per link per
+	// Sierra Chart (this DLL), shared by every chart that reads it, as NinjaTrader shares one per NinjaTrader. NinjaTrader
+	// downloads on a worker thread; here Sierra Chart makes the request (sc.MakeHTTPRequest) for one of the study
+	// instances that read the link, and that instance hands the answer back on a later call (Sierra Chart answers the
+	// instance that asked, and runs one request of a study at a time). So the feed says when a request is due (Poll,
+	// Load), an instance with no other request open takes it (Begin), and the answer is handled as NinjaTrader's
+	// Exchange handles it (Complete). NextAsk sets the schedule. Nothing here calls Sierra Chart, so the tests compare it
+	// with NinjaTrader's own code.
+	class LevelLink
+	{
+	public:
+		// NinjaTrader's Reply. Sierra Chart's answer gives only the body or its error text (FromSierra): no status, no
+		// headers.
+		struct Reply
+		{
+			int			Status		= 0;
+			std::string	Body, ETag, Problem;
+			bool		FromService	= false;
+		};
+		static const int MaxChars = 1048576;
+		// Sierra Chart's "ERROR": the server answered with an error status, which one Sierra Chart doesn't say.
+		static const int STATUS_UNNAMED = -1;
+
+		// The feed of a resolved link: one per URL for the whole DLL (NinjaTrader's For).
+		static std::shared_ptr<LevelLink> For(const std::string& url)
+		{
+			AcquireSRWLockExclusive(&feedsLock);
+			std::shared_ptr<LevelLink>& feed = Feeds()[url];
+			if (!feed)
+				feed.reset(new LevelLink(url));
+			std::shared_ptr<LevelLink> found = feed;
+			ReleaseSRWLockExclusive(&feedsLock);
+			return found;
+		}
+
+		// Tests: every feed forgotten (NinjaTrader's are per process; each oracle run is a new one).
+		static void ForgetAll()
+		{
+			AcquireSRWLockExclusive(&feedsLock);
+			Feeds().clear();
+			ReleaseSRWLockExclusive(&feedsLock);
+		}
+
+		const std::string Url;
+
+		// The template as pasted, without what a paste picks up around a link: quotes, backticks, angle brackets
+		// (Discord's no-preview form), spaces, tabs and line breaks (NinjaTrader's Clean).
+		static Text16 Clean(const std::string& templateText)
+		{
+			return TrimChars(Utf16Of(templateText), L"\"`<> \t\r\n");
+		}
+
+		static bool IsLink(const std::string& templateText)
+		{
+			const Text16 value = Clean(templateText);
+			return StartsWithOrdinalIgnoreCase(value, L"https://") || StartsWithOrdinalIgnoreCase(value, L"http://");
+		}
+
+		// NinjaTrader's Resolve: {root} (any case) becomes the root, then .NET's Uri must take it as an absolute https
+		// URL (http only for this computer) without user info or a fragment, and its AbsoluteUri is the link. The part
+		// of .NET's Uri a levels link uses is reproduced here (measured against NinjaTrader's code): the scheme and the
+		// host in lower case, the default port (written any way) left out, "\" in the path as "/", "." and ".."
+		// segments removed, an empty path as "/", an empty user info ("https://@host") kept. Anything else .NET would
+		// rewrite is refused with NinjaTrader's message: "%" escapes, characters it escapes (spaces, quotes, non-ASCII
+		// and the like), a path segment ending in a dot, a host that isn't plain letters, digits, hyphens and dots, a
+		// numeric host other than four plain numbers 0-255, an IPv6 host other than [::1], the host "loopback".
+		static bool Resolve(const std::string& templateText, const std::string& root, std::string& url, std::string& error)
+		{
+			error = "Use the https levels link from /connect in the Tatanka Discord.";
+			const Text16 cleaned = Clean(templateText), wideRoot = Utf16Of(root);
+			Text16 s;
+			for (size_t i = 0; i < cleaned.size();)
+				if (LiteralAt(cleaned, i, L"{root}"))
+				{
+					s += wideRoot;
+					i += 6;
+				}
+				else
+					s += cleaned[i++];
+			bool https = StartsWithOrdinalIgnoreCase(s, L"https://");
+			if (!https && !StartsWithOrdinalIgnoreCase(s, L"http://"))
+				return false;
+			if (s.find(L'#') != Text16::npos)
+				return false;
+			auto unreserved = [](wchar_t c) { return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'-' || c == L'.'
+				|| c == L'_' || c == L'~'; };
+			auto pchar = [&unreserved](wchar_t c) { return unreserved(c) || (c != 0 && wcschr(L"!$&'()*+,;=:@", c) != nullptr); };
+			// The authority: up to the path, the query or the end ("\" right after the host is refused).
+			const size_t from = https ? 8 : 7;
+			size_t end = from;
+			while (end < s.size() && s[end] != L'/' && s[end] != L'?' && s[end] != L'\\')
+				end++;
+			if (end < s.size() && s[end] == L'\\')
+				return false;
+			Text16 authority = s.substr(from, end - from);
+			const bool emptyUser = !authority.empty() && authority[0] == L'@';
+			if (emptyUser)
+				authority = authority.substr(1);
+			if (authority.find(L'@') != Text16::npos)
+				return false;
+			Text16 host, port;
+			bool hasPort = false;
+			if (!authority.empty() && authority[0] == L'[')
+			{
+				const size_t close = authority.find(L']');
+				if (close == Text16::npos || authority.substr(0, close + 1) != L"[::1]")
+					return false;
+				host = L"[::1]";
+				if (close + 1 < authority.size())
+				{
+					if (authority[close + 1] != L':')
+						return false;
+					hasPort = true;
+					port = authority.substr(close + 2);
+				}
+			}
+			else
+			{
+				const size_t colon = authority.find(L':');
+				host = authority.substr(0, colon);
+				if (colon != Text16::npos)
+				{
+					hasPort = true;
+					port = authority.substr(colon + 1);
+				}
+				for (wchar_t& c : host)
+				{
+					if (c >= L'A' && c <= L'Z')
+						c = (wchar_t)(c + 32);
+					if (!((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') || c == L'-' || c == L'.'))
+						return false;
+				}
+				if (host.empty() || host.size() > 253 || host == L"loopback")
+					return false;
+				// Labels of 1-63 characters, no hyphen at either end; a host of numbers only must be a plain IPv4 address.
+				bool numeric = true;
+				int labels = 0;
+				bool plainQuad = true;
+				for (size_t a = 0; a <= host.size();)
+				{
+					size_t b = host.find(L'.', a);
+					if (b == Text16::npos)
+						b = host.size();
+					const Text16 label = host.substr(a, b - a);
+					if (label.empty() || label.size() > 63 || label.front() == L'-' || label.back() == L'-')
+						return false;
+					const bool digits = label.find_first_not_of(L"0123456789") == Text16::npos;
+					const bool hex = label.size() >= 2 && label[0] == L'0' && label[1] == L'x' && label.find_first_not_of(L"0123456789abcdef", 2) == Text16::npos;
+					numeric = numeric && (digits || hex);
+					int value = 0;
+					for (wchar_t c : label)
+						value = digits && label.size() <= 3 ? value * 10 + (c - L'0') : 256;
+					plainQuad = plainQuad && digits && (label.size() == 1 || label[0] != L'0') && value <= 255;
+					labels++;
+					a = b + 1;
+				}
+				if (numeric && !(plainQuad && labels == 4))
+					return false;
+			}
+			int portValue = https ? 443 : 80;
+			if (hasPort && !port.empty())
+			{
+				long long value = 0;
+				for (wchar_t c : port)
+				{
+					if (c < L'0' || c > L'9')
+						return false;
+					value = (std::min)(value * 10 + (c - L'0'), 100000LL);
+				}
+				if (value > 65535)
+					return false;
+				portValue = (int)value;
+			}
+			// The path and the query.
+			const size_t q = s.find(L'?', end);
+			Text16 path = s.substr(end, q == Text16::npos ? Text16::npos : q - end), query = q == Text16::npos ? Text16() : s.substr(q);
+			for (wchar_t& c : path)
+			{
+				c = c == L'\\' ? L'/' : c;
+				if (c != L'/' && !pchar(c))
+					return false;
+			}
+			for (size_t i = 1; i < query.size(); i++)
+				if (query[i] != L'/' && query[i] != L'?' && !pchar(query[i]))
+					return false;
+			// RFC 3986's remove_dot_segments, as .NET does it; a segment ending in a dot is refused (.NET Framework drops
+			// its trailing dots).
+			Text16 out;
+			for (size_t i = 0; i < path.size();)
+			{
+				const size_t next = path.find(L'/', i + 1);
+				const Text16 segment = path.substr(i + 1, (next == Text16::npos ? path.size() : next) - i - 1);
+				const bool last = next == Text16::npos;
+				if (segment == L"." || segment == L"..")
+				{
+					if (segment == L".." && !out.empty())
+						out.erase(out.find_last_of(L'/'));
+					if (last)
+						out += L"/";
+				}
+				else if (!segment.empty() && segment.back() == L'.')
+					return false;
+				else
+					out += L"/" + segment;
+				i = last ? path.size() : next;
+			}
+			if (out.empty())
+				out = L"/";
+			const bool loopback = host == L"localhost" || host == L"[::1]" || (host.compare(0, 4, L"127.") == 0 && host.find_first_not_of(L"0123456789.") == Text16::npos);
+			if (!https && !loopback)
+				return false;
+			const bool defaultPort = portValue == (https ? 443 : 80);
+			url = std::string(https ? "https://" : "http://") + (emptyUser ? "@" : "") + Utf8Of(host) + (defaultPort ? "" : ":" + std::to_string(portValue))
+				+ Utf8Of(out) + Utf8Of(query);
+			error.clear();
+			return true;
+		}
+
+		// The "Published: 2026-10-15 16:45 CT" line (24-hour clock only: a 12-hour time is ignored rather than misread),
+		// as NinjaTrader's regular expression finds it, then DateTime.TryParseExact("yyyy-MM-dd H:mm"). CT_MIN when
+		// there is none. ^[ \t]*Published[ \t]*:[ \t]*(\d{4}-\d{2}-\d{2})[ T]+(\d{1,2}:\d{2})(?::\d{2})?(?![\d:]|
+		// [ \t]*[AaPp]\.?[Mm]\b), Multiline and IgnoreCase: the first line that matches.
+		static CtTime Published(const std::string& textUtf8)
+		{
+			const Text16 s = Utf16Of(textUtf8);
+			const size_t n = s.size();
+			auto digit = [&s, n](size_t i) { return i < n && IsDigitNet(s[i]); };
+			auto spaces = [&s, n](size_t i) { while (i < n && (s[i] == L' ' || s[i] == L'\t')) i++; return i; };
+			for (size_t line = 0; line <= n; line = s.find(L'\n', line) == Text16::npos ? n + 1 : s.find(L'\n', line) + 1)
+			{
+				size_t i = spaces(line);
+				if (!LiteralAt(s, i, L"published"))
+					continue;
+				i = spaces(i + 9);
+				if (i >= n || s[i] != L':')
+					continue;
+				i = spaces(i + 1);
+				const size_t date = i;
+				if (!(digit(i) && digit(i + 1) && digit(i + 2) && digit(i + 3) && i + 4 < n && s[i + 4] == L'-' && digit(i + 5) && digit(i + 6) && i + 7 < n
+					&& s[i + 7] == L'-' && digit(i + 8) && digit(i + 9)))
+					continue;
+				i += 10;
+				const size_t gap = i;
+				while (i < n && (s[i] == L' ' || FoldNet(s[i]) == L't'))
+					i++;
+				if (i == gap)
+					continue;
+				const size_t time = i;
+				const size_t hourDigits = digit(i) && digit(i + 1) ? 2 : digit(i) ? 1 : 0;
+				i += hourDigits;
+				if (hourDigits == 0 || i >= n || s[i] != L':' || !digit(i + 1) || !digit(i + 2))
+					continue;
+				i += 3;
+				const size_t timeEnd = i;
+				if (i < n && s[i] == L':' && digit(i + 1) && digit(i + 2))
+					i += 3;
+				// The look-ahead: no digit or colon next, no a.m./p.m. marker.
+				if (i < n && (IsDigitNet(s[i]) || s[i] == L':'))
+					continue;
+				const size_t k = spaces(i);
+				if (k < n && (FoldNet(s[k]) == L'a' || FoldNet(s[k]) == L'p'))
+				{
+					size_t m = k + 1;
+					bool marker = false;
+					if (m + 1 < n && s[m] == L'.' && FoldNet(s[m + 1]) == L'm')
+					{
+						m += 2;
+						marker = true;
+					}
+					else if (m < n && FoldNet(s[m]) == L'm')
+					{
+						m += 1;
+						marker = true;
+					}
+					if (marker && !(m < n && IsWordNet(s[m])))
+						continue;
+				}
+				// TryParseExact: ASCII digits, a real date, hour 0-23, minute 0-59.
+				auto ascii = [&s](size_t a, size_t b) { int v = 0; for (size_t j = a; j < b; j++) { if (s[j] < L'0' || s[j] > L'9') return -1; v = v * 10 + (s[j] - L'0'); } return v; };
+				const int year = ascii(date, date + 4), month = ascii(date + 5, date + 7), day = ascii(date + 8, date + 10);
+				const int hour = ascii(time, time + hourDigits), minute = ascii(timeEnd - 2, timeEnd);
+				if (year < 1 || month < 1 || month > 12 || day < 1 || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+					return CT_MIN;
+				if (day > DateOf(month == 12 ? year + 1 : year, month == 12 ? 1 : month + 1, 1) - DateOf(year, month, 1))
+					return CT_MIN;
+				return CtAt(DateOf(year, month, day), hour * 3600 + minute * 60);
+			}
+			return CT_MIN;
+		}
+
+		// When to ask next (Central time; NinjaTrader's NextAsk). Until the levels from the latest 8:15 / 4:45 PM
+		// publish are in hand: every 15 s for 10 minutes, then every minute for the rest of the hour. For 30 minutes
+		// after a new file: every 2 minutes (quick corrections). Otherwise every 30 minutes. Failures back off from 1
+		// to 15 minutes (1 minute at most while a publish is due). A link that is not active, or a symbol that has
+		// nothing published, is asked every 30 minutes. Charts ask only while trades arrive, so a closed market asks
+		// nothing. In hand: published at most 30 minutes before the publish time, or changed since its window opened.
+		static CtTime NextAsk(CtTime nowCt, CtTime stampCt, CtTime changedCt, int failures, int status)
+		{
+			const int64_t minute = 60;
+			int64_t wait = 30 * minute;
+			const bool quiet = status == 403 || status == 404;
+			bool due = false;
+			const int today = DateOfCt(nowCt);
+			const int64_t publishTimes[] = {8 * 3600 + 15 * 60, 16 * 3600 + 45 * 60};	// inflectionpoint's 8:15 CT (RTH) and 4:45 PM CT (Globex)
+			auto inHand = [stampCt, changedCt](CtTime at) { return stampCt >= at - 30 * 60 || changedCt >= at - 60; };
+			if (!quiet)
+				for (int day = 0; day < 2; day++)
+					for (int64_t t : publishTimes)
+					{
+						const CtTime at = CtAt(today + day, (int)t);
+						if (nowCt >= at - minute && nowCt < at + 60 * minute && !inHand(at))
+						{
+							due = true;
+							wait = (std::min)(wait, nowCt < at + 10 * minute ? (int64_t)15 : minute);
+						}
+					}
+			if (!quiet && failures > 0)
+			{
+				const int64_t backoff = (std::min)((int64_t)15, (int64_t)1 << (std::min)(4, failures - 1)) * minute;
+				wait = due ? (std::min)(backoff, minute) : backoff;
+			}
+			else if (!quiet && changedCt != CT_MIN && nowCt - changedCt < 30 * minute)
+				wait = (std::min)(wait, 2 * minute);
+			CtTime next = nowCt + wait;
+			// Wake for the next publish instead of sleeping through it.
+			if (!quiet)
+				for (int day = 0; day < 2; day++)
+					for (int64_t t : publishTimes)
+					{
+						const CtTime at = CtAt(today + day, (int)t);
+						if (at - minute > nowCt && at - minute < next && !inHand(at))
+							next = at - minute;
+					}
+			return next;
+		}
+
+		// NinjaTrader's Describe, plus Sierra Chart's unnamed error (it can't tell a link that is not active from a
+		// symbol with nothing published or a server problem, so it says the first and retries like the last).
+		static std::string Describe(const Reply& reply, bool foreign)
+		{
+			if (reply.Status == STATUS_UNNAMED)
+				return "Levels link answered an error; retrying. If it lasts, run /connect in the Tatanka Discord to get your current link.";
+			if (reply.Status == 403 && !foreign)
+				return "Levels link is not active. Run /connect in the Tatanka Discord to get your current link.";
+			if (reply.Status == 404 && !foreign)
+				return "Nothing has been published for this symbol on the levels link yet.";
+			if (reply.Status == 0)
+			{
+				Text16 detail = TrimNet(Utf16Of(reply.Problem));
+				if (detail.size() > 120)
+					detail = detail.substr(0, 120);
+				return "Levels link unreachable" + (detail.empty() ? std::string() : " (" + Utf8Of(detail) + ")") + "; retrying.";
+			}
+			return "Levels link answered HTTP " + std::to_string(reply.Status) + (foreign ? " (from a proxy or firewall?)" : "") + "; retrying.";
+		}
+
+		// Sierra Chart's answer (sc.HTTPResponse) as NinjaTrader's Reply. Sierra Chart gives the body of a successful
+		// answer; "ERROR" when the server answered with an error status, without saying which; HTTP_REQUEST_ERROR or
+		// EMPTY_RESPONSE when the request failed (its own Trading Levels study reads both as an error). It gives no
+		// headers and sends none of the study's own on a GET: no ETag, so no If-None-Match and never a 304 (an unchanged
+		// file is a 200 with the same text, which NinjaTrader's Exchange treats the same way), and no service mark.
+		// The text is decoded as NinjaTrader's StreamReader decodes it; more than 1 MB of it is NinjaTrader's error.
+		static Reply FromSierra(const std::string& answer)
+		{
+			Reply reply;
+			if (answer == "HTTP_REQUEST_ERROR" || answer == "EMPTY_RESPONSE")
+				return reply;
+			if (answer == "ERROR")
+			{
+				reply.Status = STATUS_UNNAMED;
+				return reply;
+			}
+			const Text16 text = DecodeText(answer);
+			if (text.size() > (size_t)MaxChars)
+			{
+				reply.Problem = "the levels link reply exceeds 1 MB";
+				return reply;
+			}
+			reply.Status = 200;
+			reply.Body = Utf8Of(text);
+			return reply;
+		}
+
+		// A chart's tick: asks when the time NextAsk set has come (NinjaTrader's Poll starts the request; here the
+		// instance's pump does, at once if it has no other request open).
+		void Poll(int64_t nowMs)
+		{
+			AcquireSRWLockExclusive(&lock);
+			Expire(nowMs);
+			if (!busy && nowMs >= nextMs)
+				due = true;
+			ReleaseSRWLockExclusive(&lock);
+		}
+
+		// A chart's load: asks now unless a request was answered in the last minute (NinjaTrader's Load). NinjaTrader
+		// then waits up to 3 s for the answer when the chart has no levels; Sierra Chart's chart thread never waits
+		// (LevelFileSource::AwaitingLink).
+		void Load(int64_t nowMs)
+		{
+			AcquireSRWLockExclusive(&lock);
+			Expire(nowMs);
+			if (!busy && !(askedMs != INT64_MIN && nowMs - askedMs < 60000))
+				due = true;
+			ReleaseSRWLockExclusive(&lock);
+		}
+
+		bool Due(int64_t nowMs)
+		{
+			AcquireSRWLockExclusive(&lock);
+			Expire(nowMs);
+			const bool result = due && !busy;
+			ReleaseSRWLockExclusive(&lock);
+			return result;
+		}
+
+		// The caller makes the request now (true) when one is due and none is open (NinjaTrader's Begin).
+		bool Begin(int64_t nowMs)
+		{
+			AcquireSRWLockExclusive(&lock);
+			Expire(nowMs);
+			const bool taken = due && !busy;
+			if (taken)
+			{
+				busy		= true;
+				due			= false;
+				startedMs	= nowMs;
+			}
+			ReleaseSRWLockExclusive(&lock);
+			return taken;
+		}
+
+		// The answer (NinjaTrader's Exchange, after its transport): the latest file and its version, the failures and the
+		// next ask. A 403/404 without the service's mark came from something in between: retried like any failure.
+		void Complete(const Reply& reply, CtTime nowCt, int64_t nowMs)
+		{
+			AcquireSRWLockExclusive(&lock);
+			answers++;
+			const bool foreign = (reply.Status == 403 || reply.Status == 404) && !reply.FromService;
+			status = foreign ? 502 : reply.Status;
+			if (reply.Status == 200 || reply.Status == 304)
+			{
+				failures = 0;
+				problem.clear();
+				if (reply.Status == 200)
+				{
+					etag = reply.ETag;
+					if (reply.Body != body || version == 0)
+					{
+						const bool first = version == 0;
+						if (!first)
+							changedCt = nowCt;
+						body = reply.Body;
+						version++;
+						const CtTime published = Published(body);
+						// No Published line: a file seen at chart load could be yesterday's, so it doesn't count as this
+						// publish; one that changed while asking does.
+						stampCt = published != CT_MIN ? published : first ? CT_MIN : nowCt;
+					}
+				}
+			}
+			else
+			{
+				failures++;
+				problem = Describe(reply, foreign);
+			}
+			askedMs	= nowMs;
+			nextMs	= askedMs + (NextAsk(nowCt, stampCt, changedCt, failures, status) - nowCt) * 1000;
+			busy	= false;
+			ReleaseSRWLockExclusive(&lock);
+		}
+
+		// The instance that took the request went away (the study removed) before its answer: the request is free
+		// again, and due, for another chart (NinjaTrader's worker always answers).
+		void Abandon()
+		{
+			AcquireSRWLockExclusive(&lock);
+			if (busy)
+			{
+				busy	= false;
+				due		= true;
+			}
+			ReleaseSRWLockExclusive(&lock);
+		}
+
+		// The latest answer: the version counts new files, so a chart parses each file once.
+		int Read(std::string& text, std::string& error)
+		{
+			AcquireSRWLockShared(&lock);
+			text = body;
+			error = problem;
+			const int v = version;
+			ReleaseSRWLockShared(&lock);
+			return v;
+		}
+
+		bool Busy()
+		{
+			AcquireSRWLockShared(&lock);
+			const bool b = busy;
+			ReleaseSRWLockShared(&lock);
+			return b;
+		}
+
+		// Answers handled so far (a chart that waits for its load's answer watches it).
+		int Answers()
+		{
+			AcquireSRWLockShared(&lock);
+			const int a = answers;
+			ReleaseSRWLockShared(&lock);
+			return a;
+		}
+
+		// Tests and diagnostics: the whole state.
+		struct Snapshot
+		{
+			bool		Busy = false, Due = false;
+			int			Version = 0, Failures = 0, Status = 0, Answers = 0;
+			int64_t		NextMs = INT64_MIN, AskedMs = INT64_MIN, StartedMs = INT64_MIN;
+			CtTime		StampCt = CT_MIN, ChangedCt = CT_MIN;
+			std::string	Problem, ETag, Body;
+		};
+		Snapshot State()
+		{
+			AcquireSRWLockShared(&lock);
+			Snapshot s;
+			s.Busy = busy; s.Due = due; s.Version = version; s.Failures = failures; s.Status = status; s.Answers = answers;
+			s.NextMs = nextMs; s.AskedMs = askedMs; s.StartedMs = startedMs; s.StampCt = stampCt; s.ChangedCt = changedCt;
+			s.Problem = problem; s.ETag = etag; s.Body = body;
+			ReleaseSRWLockShared(&lock);
+			return s;
+		}
+
+	private:
+		explicit LevelLink(const std::string& url) : Url(url) {}
+
+		static SRWLOCK feedsLock;
+		static std::map<std::string, std::shared_ptr<LevelLink>>& Feeds()
+		{
+			static std::map<std::string, std::shared_ptr<LevelLink>> feeds;
+			return feeds;
+		}
+
+		SRWLOCK		lock		= SRWLOCK_INIT;
+		bool		busy		= false;
+		bool		due			= false;
+		std::string	body, etag, problem;
+		int			version		= 0, failures = 0, status = 0, answers = 0;
+		// Waits run on GetTickCount64 time (NinjaTrader's Stopwatch), so a clock correction can't stall or rush the asks.
+		int64_t		nextMs		= INT64_MIN, askedMs = INT64_MIN, startedMs = INT64_MIN;
+		CtTime		stampCt		= CT_MIN, changedCt = CT_MIN;
+
+		// A request open for 2 minutes is given up (its instance gives up after 15 s and normally says so; this covers
+		// an instance Sierra Chart stopped calling): free and due again.
+		void Expire(int64_t nowMs)
+		{
+			if (busy && nowMs - startedMs >= 120000)
+			{
+				busy	= false;
+				due		= true;
+			}
+		}
+	};
+
+	SRWLOCK LevelLink::feedsLock = SRWLOCK_INIT;
+
+	// NinjaTrader's last-good levels source (LevelFileSource): the file or the levels link named by the template
+	// (or the paste box), the last valid document, its revision, and the notices. Each resolved path or link has its
+	// own last-good cache. Each instance is NinjaTrader's one LevelFileSource of a chart load.
 	struct LevelFileSource
 	{
 		LevelsDocument	Current;
@@ -2108,8 +2863,15 @@ namespace
 		double			ReferencePrice	= NaN;	// the chart price that catches another symbol's levels; NaN skips the check
 		std::function<CtTime(int64_t)>	ToCt;		// UTC seconds since the base date -> CT (NinjaTrader's TimeZoneInfo)
 		std::function<void()>			AfterRead;	// tests: runs between the read and the second time check
+		// The levels link (1.1.0): its feed, shared with every chart that reads the same link.
+		std::shared_ptr<LevelLink>		Link;
+		std::function<int64_t()>		UtcNow	= SystemUtcSeconds;										// tests replace them
+		std::function<int64_t()>		NowMs	= []() { return (int64_t)GetTickCount64(); };
+		// A chart with no levels at load waits for its link's answer: NinjaTrader waits up to 3 s on the chart's thread,
+		// Sierra Chart's never waits, so the study applies that answer when it comes (LoadAnswered).
+		bool							AwaitingLink	= false;
 
-		// NinjaTrader's ResolvePath (NT:1251-1258): .NET's checks and messages.
+		// NinjaTrader's ResolvePath (NT:1251-1258): .NET's checks and messages; a levels link is the link resolved.
 		static bool ResolvePath(const std::string& templateText, const std::string& root, std::string& path, std::string& error)
 		{
 			bool rootOk = !root.empty();
@@ -2120,6 +2882,8 @@ namespace
 				error = "Unsupported instrument root in levels path.";
 				return false;
 			}
+			if (LevelLink::IsLink(templateText))
+				return LevelLink::Resolve(templateText, root, path, error);
 			Text16 value = TrimChars(TrimNet(Utf16Of(templateText)), L"\"");
 			if (!value.empty())
 			{
@@ -2210,7 +2974,7 @@ namespace
 		}
 
 		// Initialize (NT:1259-1283): the paste box alone without a template; else the paste as a fallback, the
-		// file's last-good cache, then the file.
+		// file's or link's last-good cache, then the file, or the link asked now.
 		void Initialize(const std::string& templateText, const std::string& root, const std::string& paste, const std::string& cacheDirectory)
 		{
 			rootName = root;
@@ -2230,7 +2994,7 @@ namespace
 			std::string resolved;
 			if (!ResolvePath(templateText, root, resolved, error))
 			{
-				Error = "Levels file unavailable; " + Retained() + " " + error;
+				Error = std::string(LevelLink::IsLink(templateText) ? "Levels link" : "Levels file") + " unavailable; " + Retained() + " " + error;
 				return;
 			}
 			ResolvedPath = resolved;
@@ -2249,14 +3013,34 @@ namespace
 						CacheWarning = "Last-good cache not used: " + problem;
 				}
 			}
+			// Ask the link now. NinjaTrader waits up to 3 s for the answer when the chart has no levels at all (first
+			// setup, e.g. on a weekend); otherwise the answer is applied on a later tick, so loading never waits on the
+			// network.
+			if (LevelLink::IsLink(templateText))
+			{
+				Link = LevelLink::For(ResolvedPath);
+				Link->Load(NowMs());
+				AwaitingLink = Current.Levels.empty() && (Link->Busy() || Link->Due(NowMs()));
+				loadAnswers = Link->Answers();
+			}
 			Refresh();
 		}
 
-		// Refresh (NT:1320-1335): true when the levels changed.
-		bool Refresh()
+		// The answer a chart with no levels at load waited for has come (the study then reads it and, if it brought
+		// levels, builds the engine again from them, as NinjaTrader builds it after its wait).
+		bool LoadAnswered() const
+		{
+			return AwaitingLink && Link && Link->Answers() != loadAnswers;
+		}
+
+		// Refresh (NT:1320-1335): true when the levels changed. `ask`: a link may start a request (a chart asks only
+		// while trades arrive).
+		bool Refresh(bool ask = true)
 		{
 			if (ResolvedPath.empty())
 				return false;
+			if (Link)
+				return RefreshLink(ask);
 			const int before = Revision;
 			const Text16 wide = Utf16Of(ResolvedPath);
 			std::string text, error;
@@ -2289,6 +3073,42 @@ namespace
 			return Revision != before;
 		}
 
+		// RefreshLink (1.1.0): the download runs elsewhere (LevelLink); this parses each new file once and keeps the last
+		// valid levels. A file without a Date: line takes the trading date of now.
+		bool RefreshLink(bool ask)
+		{
+			const int before = Revision;
+			if (ask)
+				Link->Poll(NowMs());
+			std::string text, problem;
+			const int version = Link->Read(text, problem);
+			if (version != linkVersion)
+			{
+				linkVersion = version;
+				LevelsDocument document;
+				std::string error;
+				if (LevelsDocument::Parse(text, false, document, error))
+				{
+					if (!document.HasDate)
+					{
+						document.HasDate = true;
+						document.Date = TradingDate(ToCt ? ToCt(UtcNow()) : UtcNow());
+					}
+					error = Accept(document);
+				}
+				if (error.empty())
+				{
+					linkError.clear();
+					if (before != Revision || !FileExists(Utf16Of(CachePath)))
+						SaveCache();
+				}
+				else
+					linkError = "Levels link file rejected; " + Retained() + " " + error;
+			}
+			Error = !problem.empty() ? problem + " " + Retained() : linkError;
+			return Revision != before;
+		}
+
 		// Warning (NT:1349-1355): STALE when the levels' date is before the chart's trading date (a later date
 		// is normal: the 16:45 Globex publish carries the next trading date), then the error and the cache's.
 		std::string Warning(int tradingDate) const
@@ -2299,7 +3119,9 @@ namespace
 		}
 
 	private:
-		std::string	rootName, signature;
+		std::string	rootName, signature, linkError;
+		int			linkVersion	= 0;
+		int			loadAnswers	= 0;
 
 		std::string Retained() const
 		{
@@ -2749,6 +3571,8 @@ namespace
 		std::string			Warning;
 		int					Posts		= 0;	// diagnostics
 		int					Delivered	= 0;
+		// The levels link has this study's request open (Sierra Chart runs one at a time): no new post meanwhile.
+		bool				Hold		= false;
 
 		void Enqueue(const std::string& text)
 		{
@@ -2763,6 +3587,7 @@ namespace
 		bool Busy() const { return !queue.empty() || hasCurrent || pending != 0; }
 		size_t Queued() const { return queue.size(); }
 		int Pending() const { return pending; }
+		bool GaveUpOn(int id) const { return late.count(id) != 0; }
 
 		// A sender replacing another (a changed URL or switch) takes over the request the old one still has
 		// open in Sierra Chart: its answer is not this sender's, and this sender's first post waits for it.
@@ -2814,7 +3639,7 @@ namespace
 				pending		= 0;
 				detached	= false;
 			}
-			if (pending != 0)
+			if (pending != 0 || Hold)
 				return;
 			if (!hasCurrent && !queue.empty())
 			{
@@ -2933,6 +3758,94 @@ namespace
 			else
 				Warning = "Discord notification not delivered (unexpected response). Native alerts remain active.";
 		}
+	};
+
+	// One study instance's levels link request (1.1.0). Sierra Chart answers the instance that asked and runs one request
+	// of a study at a time, so the link and the Discord sender take turns: the link asks only while Discord has no
+	// request open, and Discord posts only while the link has none (DiscordSender::Hold). An answer is the open
+	// request's as Discord's are matched: by the id the request returned, or any id not answered before (Sierra Chart
+	// documents sc.MakeHTTPRequest as returning 1). No answer in 15 s: the link is told it timed out (NinjaTrader's
+	// request times out after 10 s) and the late answer is ignored; after 60 s this instance may ask again.
+	class LinkRequester
+	{
+	public:
+		LinkRequester() = default;
+		LinkRequester(const LinkRequester&) = delete;
+		LinkRequester& operator=(const LinkRequester&) = delete;
+		~LinkRequester() { Drop(); }
+
+		bool Open() const { return pending != 0; }
+
+		// Sierra Chart's answer with this id (not 0): true when it is the link's, the open request's answer (handed to
+		// its feed unless given up on) or the late answer of a request given up on (ignored). `lastAnswer`: the id of
+		// this instance's previous answer, which a later call may still carry.
+		bool Answer(int id, const std::string& text, int lastAnswer, CtTime nowCt, int64_t nowMs)
+		{
+			if (late.erase(id) != 0)
+				return true;
+			if (pending == 0 || (id != pending && id == lastAnswer))
+				return false;
+			if (!gaveUp && feed)
+				feed->Complete(LevelLink::FromSierra(text), nowCt, nowMs);
+			pending	= 0;
+			gaveUp	= false;
+			feed.reset();
+			return true;
+		}
+
+		// Each call: the timeouts, then a request for `wanted` when it is due and `free` (no Discord request open).
+		// `start` makes the request (sc.MakeHTTPRequest in the study): its id, 0 when it was not made.
+		void Pump(const std::shared_ptr<LevelLink>& wanted, bool free, CtTime nowCt, int64_t nowMs, const std::function<int(const std::string&)>& start)
+		{
+			if (pending != 0 && !gaveUp && nowMs - sentAt >= 15000)
+			{
+				gaveUp = true;
+				LevelLink::Reply timedOut;
+				timedOut.Problem = "timed out";
+				if (feed)
+					feed->Complete(timedOut, nowCt, nowMs);
+				feed.reset();
+			}
+			if (pending != 0 && nowMs - sentAt >= 60000)
+			{
+				late.insert(pending);
+				while (late.size() > 64)
+					late.erase(late.begin());
+				pending	= 0;
+				gaveUp	= false;
+			}
+			if (pending != 0 || !free || !wanted || !wanted->Begin(nowMs))
+				return;
+			const int id = start(wanted->Url);
+			if (id == 0)
+			{
+				LevelLink::Reply failed;
+				failed.Problem = "Sierra Chart did not make the request";
+				wanted->Complete(failed, nowCt, nowMs);
+				return;
+			}
+			feed	= wanted;
+			pending	= id;
+			sentAt	= nowMs;
+			gaveUp	= false;
+		}
+
+		// The study goes: a request still open is freed for another chart that reads the link.
+		void Drop()
+		{
+			if (pending != 0 && !gaveUp && feed)
+				feed->Abandon();
+			pending	= 0;
+			gaveUp	= false;
+			feed.reset();
+		}
+
+	private:
+		std::shared_ptr<LevelLink>	feed;				// the link the open request asks
+		int							pending	= 0;		// what sc.MakeHTTPRequest returned (0: none open)
+		int64_t						sentAt	= 0;
+		bool						gaveUp	= false;	// timed out: the feed was told, the answer is ignored
+		std::set<int>				late;				// requests given up on after 60 s
 	};
 
 	// A drawn line (NT:501-504). Name is NinjaTrader's name, the internal id (spec B.0.8): the label
@@ -3058,6 +3971,7 @@ namespace
 	struct Settings
 	{
 		bool tzguard_enable = true;
+		bool inst_hours = true;
 		std::string row_scale = "Auto";
 		bool tick_auto = true;
 		double tick_manual_val = 0.25;
@@ -3328,6 +4242,11 @@ namespace
 		int AlertZoneTicks = 4;
 		int MaxProfileRows = MAX_PROFILE_ROWS;
 		int MaxStructures = MAX_STRUCTURES;
+		// Not settings: InstrumentHours::Apply sets them (1.2.4). The regular hours the engine reads as RTH (the settle,
+		// the RTH open and the day's high and low the day type reads), and the minutes the TPO Session moved to them,
+		// which its TPO periods move by. ES's hours: 0830-1500 and 0, as before.
+		std::string RthSession = "0830-1500";
+		int TpoShift = 0;
 
 		// Sierra Chart only (supersets of NinjaTrader's settings, spec A.2/A.3, used from Stage 2/3):
 		int inv_start_minute = 17 * 60;		// Globex Start as a Time input (NinjaTrader: whole hours)
@@ -3341,16 +4260,218 @@ namespace
 		std::string levels_file = "";
 	};
 
+	// ---- Each market's regular hours (NinjaTrader 1.2.4's InstrumentHours, statement for statement) ----
+
+	// Each market's regular hours (CT) by NinjaTrader master instrument name (the root), micros with their parent's. The
+	// session fields are written for ES's 08:30-15:00; with Use Instrument Hours on, Apply moves them to the chart
+	// instrument's own (1.2.4). A root not listed has ES's hours: nothing moves. The study finds the root from Sierra
+	// Chart's symbol (RootOf).
+	struct InstrumentHours
+	{
+		static constexpr int EsOpen = 8 * 60 + 30;
+		static constexpr int EsClose = 15 * 60;
+
+		struct Hours
+		{
+			int Open	= EsOpen;
+			int Close	= EsClose;
+		};
+
+		// NinjaTrader's table (a Dictionary with StringComparer.OrdinalIgnoreCase: the roots are ASCII, so upper case).
+		static const std::map<std::string, Hours>& Table()
+		{
+			static const std::map<std::string, Hours> table = []()
+			{
+				std::map<std::string, Hours> t;
+				auto add = [&t](const char* open, const char* close, std::initializer_list<const char*> roots)
+				{
+					Hours h;
+					h.Open	= Clock(open);
+					h.Close	= Clock(close);
+					for (const char* root : roots)
+						t[root] = h;
+				};
+				add("08:30", "15:00", {"ES", "MES", "NQ", "MNQ", "RTY", "M2K", "YM", "MYM", "EMD", "NKD"});	// equity index
+				add("08:00", "13:30", {"CL", "MCL", "QM", "NG", "RB", "HO"});									// energy
+				add("07:20", "12:30", {"GC", "MGC"});															// metals
+				add("07:25", "12:25", {"SI", "SIL"});
+				add("07:10", "12:00", {"HG", "MHG"});
+				add("07:20", "12:05", {"PL"});
+				add("07:30", "12:00", {"PA"});
+				add("07:20", "14:00", {"ZT", "ZF", "ZN", "TN", "ZB", "UB", "SR3"});								// interest rates
+				add("07:20", "14:00", {"6E", "M6E", "6B", "6J", "6A", "6C", "6S", "6N", "6M"});				// currencies
+				return t;
+			}();
+			return table;
+		}
+
+		static int Clock(const char* hm) { return ((hm[0] - '0') * 10 + (hm[1] - '0')) * 60 + (hm[3] - '0') * 10 + (hm[4] - '0'); }
+
+		// The root's regular hours, open and close in minutes of the day (ES's for a root not listed).
+		static Hours Of(const std::string& root)
+		{
+			const auto found = Table().find(Upper(root));
+			return found != Table().end() ? found->second : Hours();
+		}
+
+		// Whether the root is in the table (the study logs a root that isn't).
+		static bool Listed(const std::string& root) { return Table().count(Upper(root)) != 0; }
+
+		static int Mod(int m) { return (m % 1440 + 1440) % 1440; }
+
+		// A CT time (minutes of the day) written for ES's hours, at the same place in open-close: one nearer the open
+		// moves with the open, one nearer the close with the close (CL: the IB 08:30-09:30 is 08:00-09:00, the 15:00 close
+		// 13:30); the overnight (before 07:00, from 16:00) stays.
+		static int Move(int m, int open, int close)
+		{
+			if (m < 7 * 60 || m >= 16 * 60)
+				return m;
+			return m + (std::abs(m - EsOpen) <= std::abs(m - EsClose) ? open - EsOpen : close - EsClose);
+		}
+
+		// A window's start and end moved as a whole: each end on its own, unless that changes the window's order. Two
+		// ends either side of 11:45, closer than the open's and close's moves differ by, would land on the same minute or
+		// past each other (11:00-12:00: 10:30-10:30 on CL, 09:50-09:30 on GC): then both move as its middle does, keeping
+		// its length (CL 10:30-11:30, GC 09:50-10:50).
+		static void MoveWindow(int& a, int& b, int open, int close)
+		{
+			const int x = Move(a, open, close), y = Move(b, open, close);
+			if (a == b || ((a < b) == (x < y) && x != y))
+			{
+				a = x;
+				b = y;
+				return;
+			}
+			const int mid = (a + Mod(b - a) / 2) % 1440, d = Move(mid, open, close) - mid;
+			a = Mod(a + d);
+			b = Mod(b + d);
+		}
+
+		// "HHmm-HHmm" (optionally ":days") moved (MoveWindow); anything else as it is. Each end is .NET's Trim()med, 3 or
+		// 4 digits, padded to 4 (UTF-16 lengths, as .NET's).
+		static std::string MoveSession(const std::string& v, int open, int close)
+		{
+			const size_t colon = v.find(':');
+			const std::string range = colon == std::string::npos ? v : v.substr(0, colon);
+			const size_t dash = range.find('-');
+			if (dash == std::string::npos || range.find('-', dash + 1) != std::string::npos)
+				return v;
+			int m[2] = {0, 0};
+			for (int i = 0; i < 2; i++)
+			{
+				const Text16 e = TrimNet(Utf16Of(i == 0 ? range.substr(0, dash) : range.substr(dash + 1)));
+				if (e.size() < 3 || e.size() > 4)
+					return v;
+				for (wchar_t c : e)
+					if (c < L'0' || c > L'9')
+						return v;
+				const Text16 padded = Text16(4 - e.size(), L'0') + e;
+				m[i] = ((padded[0] - L'0') * 10 + (padded[1] - L'0')) * 60 + (padded[2] - L'0') * 10 + (padded[3] - L'0');
+			}
+			MoveWindow(m[0], m[1], open, close);
+			return Hhmm(m[0]) + "-" + Hhmm(m[1]) + (colon == std::string::npos ? std::string() : v.substr(colon));
+		}
+
+		// .NET's (m / 60).ToString("00") + (m % 60).ToString("00") (a negative part, which the table's hours never give: "-01").
+		static std::string Hhmm(int m)
+		{
+			auto two = [](int v)
+			{
+				char text[16];
+				snprintf(text, sizeof(text), "%s%02d", v < 0 ? "-" : "", v < 0 ? -v : v);
+				return std::string(text);
+			};
+			return two(m / 60) + two(m % 60);
+		}
+
+		// A session's length in hours ("0830-1500": 6.5; one past midnight counts on); false if it doesn't read or is none.
+		// NinjaTrader's Regex "^([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})".
+		static bool HoursLong(const std::string& session, double& hours)
+		{
+			if (session.size() < 9 || session[4] != '-')
+				return false;
+			for (int i : {0, 1, 2, 3, 5, 6, 7, 8})
+				if (session[(size_t)i] < '0' || session[(size_t)i] > '9')
+					return false;
+			auto two = [&session](size_t i) { return (session[i] - '0') * 10 + (session[i + 1] - '0'); };
+			const int a = two(0) * 60 + two(2), b = two(5) * 60 + two(7);
+			const int len = Mod(b - a);
+			if (len == 0)
+				return false;
+			hours = len / 60.0;
+			return true;
+		}
+
+		// NinjaTrader's Start: int.Parse of the first end's first two characters * 60 + int.Parse of the rest (a session
+		// that validated).
+		static int Start(const std::string& session)
+		{
+			const std::string range = session.substr(0, session.find(':'));
+			const std::string a = range.substr(0, range.find('-'));
+			int h = 0, m = 0;
+			if (a.size() < 2 || !TryParseNetInt(a.substr(0, 2), h) || !TryParseNetInt(a.substr(2), m))
+				return 0;
+			return h * 60 + m;
+		}
+
+		// The settings as the chart's instrument runs them: with Use Instrument Hours on, on a root whose hours aren't
+		// ES's, a copy with every session field moved to its hours, the RTH VWAP window as one, the end of the overnight
+		// count, a Session Duration that was the Session profile's own length the moved one's, the regular hours themselves
+		// (RthSession) and the TPO periods' shift (TpoShift: the TPO Session's start moved, so its periods fall in it as
+		// on ES). Otherwise the settings as typed. The typed ones are what Warn if Session Times Were Changed checks.
+		// Sierra Chart's Globex Start Time (inv_start_minute) stays, as NinjaTrader's Globex Start H does.
+		static Settings Apply(const Settings& s, const std::string& root)
+		{
+			const Hours oc = Of(root);
+			const int o = oc.Open, c = oc.Close;
+			if (!s.inst_hours || (o == EsOpen && c == EsClose))
+				return s;
+			Settings r = s;
+			r.pd_sess_time		= MoveSession(s.pd_sess_time, o, c);
+			r.cc_sess_def		= MoveSession(s.cc_sess_def, o, c);
+			r.amt_sess			= MoveSession(s.amt_sess, o, c);
+			r.amt_del_sess		= MoveSession(s.amt_del_sess, o, c);
+			r.ib_session		= MoveSession(s.ib_session, o, c);
+			r.ib_stop_time		= MoveSession(s.ib_stop_time, o, c);
+			r.ib_alert_time		= MoveSession(s.ib_alert_time, o, c);
+			r.mvp_sess_time		= MoveSession(s.mvp_sess_time, o, c);
+			r.mvp_alert_time	= MoveSession(s.mvp_alert_time, o, c);
+			r.sp_rth_session	= MoveSession(s.sp_rth_session, o, c);
+			r.spikeTimeRange	= MoveSession(s.spikeTimeRange, o, c);
+			r.tbl_session		= MoveSession(s.tbl_session, o, c);
+			r.context_session	= MoveSession(s.context_session, o, c);
+			int va = s.vwap_start_h * 60 + s.vwap_start_m, vb = s.vwap_end_h * 60 + s.vwap_end_m;
+			MoveWindow(va, vb, o, c);
+			r.vwap_start_h = va / 60;
+			r.vwap_start_m = va % 60;
+			r.vwap_end_h = vb / 60;
+			r.vwap_end_m = vb % 60;
+			const int inv = Move(s.inv_end_h * 60 + s.inv_end_m, o, c);
+			r.inv_end_h = inv / 60;
+			r.inv_end_m = inv % 60;
+			double typed = 0, moved = 0;
+			if (HoursLong(s.mvp_sess_time, typed) && s.mvp_sess_dur == typed)
+				r.mvp_sess_dur = HoursLong(r.mvp_sess_time, moved) ? moved : s.mvp_sess_dur;
+			r.RthSession = MoveSession("0830-1500", o, c);
+			r.TpoShift = Mod(Start(r.sp_rth_session) - Start(s.sp_rth_session) + 720) - 720;
+			return r;
+		}
+	};
+
+	bool ListedRoot(const std::string& root)
+	{
+		return InstrumentHours::Listed(root);
+	}
+
 	// The sessions of a Settings, parsed once (an engine is built only from validated settings).
 	struct SessionSet
 	{
-		SessionSpec rth, ibWindow, mvp_sess_time, mvp_alert_time, ib_session, ib_alert_time, ib_stop_time, amt_sess, amt_del_sess, pd_sess_time,
+		SessionSpec rth, mvp_sess_time, mvp_alert_time, ib_session, ib_alert_time, ib_stop_time, amt_sess, amt_del_sess, pd_sess_time,
 			cc_sess_def, sp_rth_session, spikeTimeRange, context_session, tbl_session;
 
 		explicit SessionSet(const Settings& s)
 		{
-			ParseSession("0830-1500", rth);		// SESS_RTH, a constant (PINE:41)
-			ParseSession("0830-0930", ibWindow);	// Classify's opening-hour test (NT:858)
+			ParseSession(s.RthSession, rth);	// the regular hours: 0830-1500 on ES's (PINE:41), the market's own (1.2.4)
 			ParseSession(s.mvp_sess_time, mvp_sess_time);
 			ParseSession(s.mvp_alert_time, mvp_alert_time);
 			ParseSession(s.ib_session, ib_session);
@@ -3423,11 +4544,40 @@ namespace
 		// The last bar's zone ATR (Process's local zoneAtr, NT:744), kept for the tests; the zones and flips
 		// read the local.
 		double lastZoneAtr = NaN;
+		// Every pd line switches to the session that just closed at its close (1.2.2): pdPOC/pdVAH/pdVAL and the drawn
+		// profile from its trades at the value area's close (valueRolled until the next trade date), pdHigh/pdLow/pdOpen
+		// at the pd session's. Lines drawn from then (vaRolledAt, pdRolledAt) to the next trade date's open.
+		bool valueRolled = false;
+		CtTime vaRolledAt = CT_MIN, pdRolledAt = CT_MIN;
+		// The trade date's own reference: the value in force at its open (the 80% Rule, OPEN, day type) and the pd high
+		// and low its open was measured against; the close's roll leaves them as they were (1.2.2).
+		ProfileStats dayVa;
+		double openH = NaN, openL = NaN;
+		double tpoH = NaN, tpoL = NaN;		// the TPO session's high and low: its Poor High and Poor Low (1.2.2)
+		Profile mm;							// the month's minutes: the prior month's value when complete (1.2.2)
+		int pmMinutes = NO_DATE;			// the month whose value came from them
+		// The prior day's value from its trades at one-tick rows (as a tick volume profile) when the driver has them
+		// (1.2.0): TradeValue(first, end, minuteVolume) gives the RTH window's (price, volume) pairs, or false and the
+		// day's minutes are used. vaFirst/vaEnd: the window; lastVa*: the one prevDay was worked out from.
+		std::function<bool(CtTime first, CtTime end, double minuteVolume, PriceVolumes& out)> TradeValue;
+		CtTime vaFirst = CT_MIN, vaEnd = CT_MIN, lastVaFirst = CT_MIN, lastVaEnd = CT_MIN;
+		double lastVaVolume = 0;
+		bool hasDayTicks = false;			// the prior day's trades (dayTicks) are known
+		PriceVolumes dayTicks;
+		CtTime dayTicksFirst = CT_MIN;
+		bool hasMainStats = false;			// the main profile's value area when it is drawn from those trades (TickProfile, 1.2.1)
+		ProfileStats mainStats;
+		// The current Session or Weekly profile from its trades (1.2.2): MinuteTrades(minute start, its 1-minute volume)
+		// gives that minute's (price, volume) pairs when all of its trades are known, or false and its 1-minute bar is
+		// spread over its range as before. Monthly and Yearly profiles, and older periods, use 1-minute bars.
+		std::function<bool(CtTime minute, double volume, PriceVolumes& out)> MinuteTrades;
 
 		double RowStep(int mult) const { return (std::max)(Step * mult, S->mvp_row_size); }
-		// Daily and prior-month profiles keep the plain Row Size at 1x, as before.
-		double ValueStep(int mult) const { return mult > 1 ? (std::max)(S->mvp_row_size, Step * mult) : S->mvp_row_size; }
-		double NakedStep(int mult) const { return (S->amt_vauto ? Step : S->amt_vres ? S->amt_res_val : Step) * mult; }
+		// The prior day's and month's rows: the drawn profile's (1.2.2: GC's 0.25 Row Size is 0.5 rows there, on 0.1 ticks).
+		double ValueStep(int mult) const { return RowStep(mult); }
+		// nPOC rows: the drawn profile's (1.2.2: CL's 0.05 auto tick drew a weekly nPOC off the weekly profile's POC), or
+		// the Manual Bin Size set.
+		double NakedStep(int mult) const { return !S->amt_vauto && S->amt_vres ? S->amt_res_val * mult : RowStep(mult); }
 		double BlockStep(int mult) const { return Step * (std::max)(1, S->sp_ticks_per_block) * mult; }
 
 	public:
@@ -3444,6 +4594,7 @@ namespace
 			nd = Profile(NakedStep(rowMult), s->MaxProfileRows);
 			nw = Profile(NakedStep(rowMult), s->MaxProfileRows);
 			nm = Profile(NakedStep(rowMult), s->MaxProfileRows);
+			mm = Profile(RowStep(rowMult), s->MaxProfileRows);
 			spStep = BlockStep(rowMult);
 			Levels = ParseLevels(s->lvl_text);	// NT:567: the accepted document's text (spec B.4.7)
 		}
@@ -3464,7 +4615,100 @@ namespace
 			pivotBias = "---";
 		}
 
+		// The ticks of the day just ended came after its roll (NinjaTrader: the chart was loading; Sierra Chart: the tick
+		// file was read after it): its value from them from now on, and whether the RTH open was outside it. True when
+		// that changed it (1.2.0). After the close's roll it is the closed session's own value, not the one today is
+		// measured against; before it, today's 80% Rule starts over on the ticks' value area (1.2.1).
+		bool RefreshPrevDay()
+		{
+			ProfileStats t;
+			if (!TickValue(lastVaFirst, lastVaEnd, lastVaVolume, t) || (t.Poc == prevDay.Poc && t.Vah == prevDay.Vah && t.Val == prevDay.Val))
+				return false;
+			prevDay = t;
+			TickProfile();
+			if (valueRolled)
+				return true;
+			dayVa = prevDay;
+			if (Valid(rthO))
+			{
+				outsideAbove = rthO > dayVa.Vah;
+				outsideBelow = rthO < dayVa.Val;
+			}
+			rule = false;
+			hasVaEntry = false;
+			return true;
+		}
+
+		CtTime DayStart() const { return dayStart; }
+		// After the close's roll the value refreshed is the closed session's own: today's 80% Rule fill stays as it is.
+		bool ValueRolled() const { return valueRolled; }
+
 	private:
+		// The prior day's value: its minutes', or its trades' when the driver has them (1.2.0), and its drawn profile.
+		ProfileStats DayValue()
+		{
+			const ProfileStats minutes = day.Stats(S->cc_va_pct);
+			lastVaFirst		= vaFirst;
+			lastVaEnd		= vaEnd;
+			lastVaVolume	= minutes.Total;
+			hasDayTicks		= false;
+			dayTicks.clear();
+			ProfileStats value;
+			const bool ticks = TickValue(vaFirst, vaEnd, minutes.Total, value);
+			TickProfile();
+			return ticks ? value : minutes;
+		}
+
+		// The window's trades at one-tick rows (a tick volume profile, FromPrices at the instrument's tick); false when
+		// the driver has none.
+		bool TickValue(CtTime first, CtTime end, double minuteVolume, ProfileStats& value)
+		{
+			if (!TradeValue || first == CT_MIN)
+				return false;
+			PriceVolumes prices;
+			if (!TradeValue(first, end, minuteVolume, prices) || prices.empty())
+				return false;
+			dayTicks		= prices;
+			hasDayTicks		= true;
+			dayTicksFirst	= first;
+			value = Profile::FromPrices(Tick > 0 ? Tick : Step, prices).Stats(S->cc_va_pct);
+			return true;
+		}
+
+		// A session's hours: "0830-1500:23456" -> "0830-1500" (NinjaTrader's Split(':')[0].Trim()).
+		static std::string Hours(const std::string& session)
+		{
+			return Utf8Of(TrimNet(Utf16Of(session.substr(0, session.find(':')))));
+		}
+
+		// The prior day's drawn profile from the same trades as its pdPOC/pdVAH/pdVAL (1.2.1), at one-tick rows as the
+		// lines are worked out: its tallest row is pdPOC and its shaded area ends at pdVAH and pdVAL (at the same Value
+		// Area %), whatever the Row Scale. Only a Session profile on the value area's own hours is that day's.
+		void TickProfile()
+		{
+			if (!hasDayTicks || S->mvp_tf_mode != "Session" || Hours(S->mvp_sess_time) != Hours(S->cc_sess_def))
+				return;
+			const double tickStep = Tick > 0 ? Tick : Step;
+			if (!main->Rows.empty() && DateOfCt(mainStart) == DateOfCt(dayTicksFirst))
+			{
+				main = std::make_shared<Profile>(Profile::FromPrices(tickStep, dayTicks, main->Limit));
+				mainStats		= main->Stats(S->mvp_val_pct);
+				hasMainStats	= true;
+				return;
+			}
+			for (size_t i = profiles.size(); i-- > 0;)
+			{
+				if (DateOfCt(profiles[i]->Start) != DateOfCt(dayTicksFirst))
+					continue;
+				auto past	= std::make_shared<PastProfile>(*profiles[i]);
+				auto ticks	= std::make_shared<Profile>(Profile::FromPrices(tickStep, dayTicks, past->Data->Limit));
+				past->Data	= ticks;
+				past->Stats	= ticks->Stats(S->mvp_val_pct);
+				profiles[i]	= past;
+				return;
+			}
+		}
+
 		bool Was(const SessionSpec& session) const { return hasPrevious && InSession(previous.Start, session); }
 		// NinjaTrader's Max/Min: NaN (not yet set) is absent (NT:578-579).
 		static double Max(double a, double b) { return Valid(a) ? MaxNet(a, b) : b; }
@@ -3512,11 +4756,17 @@ namespace
 		}
 
 	public:
+		// Session: the date its Session Time window began (1.2.3), so a window through midnight (1700-1600) is one profile.
 		int ProfileKey(const Bar& b) const
 		{
 			const int d = TradingDate(b.Start);
-			return S->mvp_tf_mode == "Weekly" ? WeekOf(d) : S->mvp_tf_mode == "Monthly" ? MonthOf(d) : S->mvp_tf_mode == "Yearly" ? YearOf(d)
-				: DateOfCt(b.Start);
+			if (S->mvp_tf_mode == "Weekly")
+				return WeekOf(d);
+			if (S->mvp_tf_mode == "Monthly")
+				return MonthOf(d);
+			if (S->mvp_tf_mode == "Yearly")
+				return YearOf(d);
+			return DateOfCt(b.Start - (CtTime)sess.mvp_sess_time.A * 60);
 		}
 
 		// Sub-bars merged into clock-aligned buckets of `size` minutes (NT:602-612).
@@ -3568,7 +4818,7 @@ namespace
 		{
 			if (macroKey != key)
 			{
-				if (macroKey != NO_DATE && macroFull)
+				if (macroKey != NO_DATE && macroFull && macroKey != pmMinutes)
 					prevMonth = macro.Stats(S->mvp_val_pct);
 				macroFull = macroKey != NO_DATE;
 				macro = Profile(ValueStep(RowMult(S->row_scale, lastPrice, Step)), S->MaxProfileRows);
@@ -3593,10 +4843,25 @@ namespace
 			const bool pdSession = InSession(b.Start, sess.pd_sess_time), track = InSession(b.Start, sess.context_session),
 				table = InSession(b.Start, sess.tbl_session);
 			const bool spikeWindow = InSession(b.Start, sess.spikeTimeRange), spSession = InSession(b.Start, sess.sp_rth_session);
+			// The value area's session just closed (or a new trade date began on an RTH-only chart): the prior day's value
+			// and its drawn profile are the closed session's from here, from its trades when they are worked out (1.2.2).
+			if (Was(sess.cc_sess_def) && (newDay || !InSession(b.Start, sess.cc_sess_def)) && dayFull && !day.Rows.empty())
+			{
+				prevDay		= DayValue();
+				valueRolled	= true;
+				vaRolledAt	= b.Start;
+			}
 			if (newDay)
 			{
-				if (td != NO_DATE && dayFull && !day.Rows.empty())
-					prevDay = day.Stats(S->cc_va_pct);
+				if (!valueRolled)
+				{
+					if (td != NO_DATE && dayFull && !day.Rows.empty())
+						prevDay = DayValue();
+					else
+						lastVaFirst = CT_MIN;
+				}
+				valueRolled = false;
+				dayVa = prevDay;
 				if (!S->pd_use_rth && td != NO_DATE)
 				{
 					pdH = tradeH;
@@ -3606,6 +4871,7 @@ namespace
 				dayFull = td != NO_DATE || MinuteOfDay(b.Start) == 1020;
 				day = Profile(ValueStep(rowMult), S->MaxProfileRows);
 				nd = Profile(NakedStep(rowMult), S->MaxProfileRows);
+				vaFirst = vaEnd = CT_MIN;
 				td = d;
 				dayStart = b.Start;
 				tradeH = b.High;
@@ -3653,6 +4919,12 @@ namespace
 				{
 					pmH = monthH;
 					pmL = monthL;
+					// a whole month of minutes: its value as its profile and nPOC have it, not the 30-minute bars' (1.2.2)
+					if (!mm.Rows.empty())
+					{
+						prevMonth = mm.Stats(S->mvp_val_pct);
+						pmMinutes = month;
+					}
 				}
 				NakedRoll(nm, "Monthly", monthFull, S->npoc_m_show, S->npoc_w_m, b.Start);
 				monthFull = month != NO_DATE;
@@ -3661,6 +4933,7 @@ namespace
 				monthH = b.High;
 				monthL = b.Low;
 				nm = Profile(NakedStep(rowMult), S->MaxProfileRows);
+				mm = Profile(RowStep(rowMult), S->MaxProfileRows);
 			}
 			else
 			{
@@ -3690,8 +4963,9 @@ namespace
 						Event(f, "nPOC" + naked[i].Kind + Price(naked[i].Price), naked[i].Kind + " nPOC Touch @ " + Price(naked[i].Price));
 					naked.erase(naked.begin() + (std::ptrdiff_t)i);
 				}
-			// The overnight high and low (NT:673-677).
-			if (ovn && S->amt_enable)
+			// The overnight high and low (NT:673-677), kept with OVN High/Low off too: the day type reads them (they're
+			// drawn and alert only when on, 1.2.2).
+			if (ovn)
 			{
 				if (!Was(sess.amt_sess) || newDay)
 				{
@@ -3704,11 +4978,23 @@ namespace
 					ovnL = Min(ovnL, b.Low);
 				}
 			}
-			// The prior day's high, low and open (NT:678-684): pdHigh/pdLow switch to the custom session
-			// that just closed when it ends (15:00); the daily bar is the fallback until one has.
+			// The prior day's high, low and open (NT:678-684): the pd session just closed (or a new trade date began on
+			// an RTH-only chart): pdHigh, pdLow and pdOpen are its own from here, as pdPOC/pdVAH/pdVAL are the value area's
+			// at its close (the same 15:00 by default: every pd line switches together, 1.2.2); the daily bar is the
+			// fallback until one has.
+			if (Was(sess.pd_sess_time) && (newDay || !pdSession))
+			{
+				if (S->pd_use_rth)
+				{
+					pdH = rthH;
+					pdL = rthL;
+				}
+				pdO = rthPreviousOpen;
+				pdRolledAt = b.Start;
+			}
 			if (pdSession)
 			{
-				if (!Was(sess.pd_sess_time))
+				if (!Was(sess.pd_sess_time) || newDay)
 				{
 					rthH = b.High;
 					rthL = b.Low;
@@ -3720,15 +5006,6 @@ namespace
 					rthL = Min(rthL, b.Low);
 				}
 			}
-			if (!pdSession && Was(sess.pd_sess_time))
-			{
-				if (S->pd_use_rth)
-				{
-					pdH = rthH;
-					pdL = rthL;
-				}
-				pdO = rthPreviousOpen;
-			}
 			if (daily != nullptr)
 			{
 				if (!Valid(pdH))
@@ -3736,7 +5013,8 @@ namespace
 				if (!Valid(pdL))
 					pdL = daily->Low;
 			}
-			// The settlement: the close of the last bar of 08:30-15:00 (NT:685-688).
+			// The settlement: the close of the last bar of the regular hours (RthSession: 08:30-15:00 on ES, the market's own
+			// with Use Instrument Hours, 1.2.4; NT:685-688).
 			if (!rth && Was(sess.rth))
 			{
 				settle = previous.Close;
@@ -3764,6 +5042,9 @@ namespace
 				trap = false;
 				resolved = true;
 			}
+			// OVN INVENTORY as the count stood at its last overnight bar (1.2.2; it read 08:15's, before the trap resolved).
+			if (globex)
+				inventoryFrozen = Inventory();
 			if (S->inv_alert && S->inv_enable && trap && !trapAlert && barMinute >= rthOpenMinute && barMinute < rthOpenMinute + 30)
 			{
 				Event(f, "Inventory", "Inventory Trap Active @ " + Price(settle));
@@ -3785,18 +5066,13 @@ namespace
 					ibWorkL = MinNet(ibWorkL, b.Low);
 				}
 			}
-			if (!ib && Was(sess.ib_session) && S->ib_enable)
+			// With Enable IB off too: the day type reads it (drawn only when on, 1.2.2).
+			if (!ib && Was(sess.ib_session))
 			{
 				ibH = ibWorkH;
 				ibL = ibWorkL;
 			}
-			// The dashboard's inventory, frozen when the Context Tracking Session starts (NT:703).
-			if (track && (!Was(sess.context_session) || newDay))
-				inventoryFrozen = Inventory();
-			// The RTH open: the first bar of the RTH Session for VA (NT:704).
-			if (InSession(b.Start, sess.cc_sess_def) && (!Was(sess.cc_sess_def) || newDay))
-				rthO = b.Open;
-			// The RTH start (08:30): the day type's reset, the gap and outside-value tests (NT:705-711).
+			// The RTH start (the regular open, RthSession's start: 08:30 on ES): the day type's reset (NT:705-711).
 			if (rth && (!Was(sess.rth) || newDay))
 			{
 				rthStart = b.Start;
@@ -3805,12 +5081,21 @@ namespace
 				dayL = b.Low;
 				auction = false;
 				otfUp = otfDn = 0;
-				const double openPrice = Valid(rthO) ? rthO : b.Open;
 				isTrapDay = S->inv_enable && imbalance;
-				gapUp = Valid(pdH) && openPrice > pdH;
-				gapDown = Valid(pdL) && openPrice < pdL;
-				outsideAbove = Valid(prevDay.Vah) && openPrice > prevDay.Vah;
-				outsideBelow = Valid(prevDay.Val) && openPrice < prevDay.Val;
+				if (!Valid(rthO))
+					gapUp = gapDown = outsideAbove = outsideBelow = false;	// the value area's session opens later: its open decides these
+			}
+			// The RTH open: the first bar of the RTH Session for VA, the open OPEN, the gap test and the 80% Rule all
+			// measure, against the pd values in force at it (1.2.2).
+			if (InSession(b.Start, sess.cc_sess_def) && (!Was(sess.cc_sess_def) || newDay))
+			{
+				rthO = b.Open;
+				openH = pdH;
+				openL = pdL;
+				gapUp = Valid(pdH) && b.Open > pdH;
+				gapDown = Valid(pdL) && b.Open < pdL;
+				outsideAbove = Valid(dayVa.Vah) && b.Open > dayVa.Vah;
+				outsideBelow = Valid(dayVa.Val) && b.Open < dayVa.Val;
 			}
 			// The late spike (NT:712-719): the RTH range before the window, frozen when it starts; a close
 			// beyond it at the window's end leaves the spike's base, removed (with an alert) when touched.
@@ -3858,7 +5143,7 @@ namespace
 				{
 					auto past		= std::make_shared<PastProfile>();
 					past->Data		= main;
-					past->Stats		= main->Stats(S->mvp_val_pct);
+					past->Stats		= hasMainStats ? mainStats : main->Stats(S->mvp_val_pct);
 					past->Start		= mainStart;
 					past->End		= b.Start;
 					past->EndIndex	= b.Index;
@@ -3870,16 +5155,43 @@ namespace
 				main = std::make_shared<Profile>(RowStep(rowMult), S->MaxProfileRows);
 				mainKey = pk;
 				mainStart = b.Start;
+				hasMainStats = false;
 			}
-			// Prior-day value is built from the RTH Session for VA only (08:30-15:00 CT by default), the Dalton convention.
+			// Prior-day value is built from the RTH Session for VA only (08:30-15:00 CT by default, moved to the market's
+			// own hours with Use Instrument Hours), the Dalton convention.
+			// A Session or Weekly profile takes each minute's trades where the driver has them (1.2.2); a bar with none keeps
+			// Calc Precision's bars, as every past profile without trades (1.2.3: rows, tradeRows).
+			std::vector<PriceVolumes> rows;
+			if (mainWindow && MinuteTrades && (S->mvp_tf_mode == "Session" || S->mvp_tf_mode == "Weekly"))
+				for (const Bar& one : subbars)
+				{
+					rows.emplace_back();
+					if (!MinuteTrades(one.Start, one.Volume, rows.back()))
+						rows.back().clear();
+				}
+			const bool tradeRows = std::any_of(rows.begin(), rows.end(), [](const PriceVolumes& x) { return !x.empty(); });
 			for (const Bar& q : Aggregate(raw, calc))
 			{
-				if (mainWindow)
+				mm.Add(q, true);
+				if (mainWindow && !tradeRows)
 					main->Add(q, true);
 				if (S->cc_enable && InSession(q.Start, sess.cc_sess_def))
+				{
 					day.Add(q, true);
+					if (vaFirst == CT_MIN)
+						vaFirst = q.Start;
+					vaEnd = q.End;
+				}
 			}
-			const ProfileStats dev = main->Stats(S->mvp_val_pct);
+			if (tradeRows)
+				for (size_t i = 0; i < subbars.size(); i++)
+				{
+					if (!rows[i].empty())
+						main->AddPrices(rows[i]);
+					else
+						main->Add(subbars[i], true);
+				}
+			const ProfileStats dev = hasMainStats ? mainStats : main->Stats(S->mvp_val_pct);
 			UpdateTpo(b, spSession);
 			// The trading day's VWAP (from 17:00, hlc3 of the chart bars) for the day type (NT:735-736).
 			contextHlc += (b.High + b.Low + b.Close) / 3 * b.Volume;
@@ -3901,7 +5213,7 @@ namespace
 			f.RthVwap = S->vwap_enable && vwin && vVol > 0 ? vSrc / vVol : NaN;
 			const double dtr = daily == nullptr ? NaN : MaxNet(tradeH - tradeL, MaxNet(std::fabs(tradeH - daily->Close), std::fabs(tradeL - daily->Close)));
 			f.DailyAtr = daily != nullptr && Valid(daily->Atr) ? (daily->Atr * (S->daily_atr_length - 1) + dtr) / S->daily_atr_length : NaN;
-			const double zoneAtr = daily != nullptr && Valid(daily->Atr14) ? (daily->Atr14 * 13 + dtr) / 14 : NaN;
+			const double zoneAtr = f.DailyAtr;	// the level zones' ATR is the Daily ATR Period's, as the dashboard's (it was always 14 before 1.2.2)
 			lastZoneAtr = zoneAtr;
 			if (rth)
 				Classify(b, dailyVwap, f.DailyAtr);
@@ -3915,11 +5227,13 @@ namespace
 						break;
 					}
 			// The 80% Rule (NT:751-762): the RTH open outside the prior day's value, then 60 minutes of
-			// closes inside it within the Prev Day Custom Session; confirmed once per trading date.
-			f.RuleActive = S->cc_enable && Valid(rthO) && (rthO > prevDay.Vah || rthO < prevDay.Val);
+			// closes inside it within the Prev Day Custom Session; confirmed once per trading date. The value in force
+			// at today's open (after the close the pd lines are today's own, 1.2.2).
+			const ProfileStats va = dayVa;
+			f.RuleActive = S->cc_enable && Valid(rthO) && (rthO > va.Vah || rthO < va.Val);
 			if (f.RuleActive && pdSession)
 			{
-				if (b.Close < prevDay.Vah && b.Close > prevDay.Val)
+				if (b.Close < va.Vah && b.Close > va.Val)
 				{
 					if (!hasVaEntry)
 					{
@@ -3939,9 +5253,9 @@ namespace
 			if (!pdSession && !rule)
 				hasVaEntry = false;
 			f.RuleConfirmed	= rule;
-			f.VaHigh		= prevDay.Vah;
-			f.VaLow			= prevDay.Val;
-			// The daily levels flip once price passes them by the Flip ATR Buffer (14-day zone ATR), and alert
+			f.VaHigh		= va.Vah;
+			f.VaLow			= va.Val;
+			// The daily levels flip once price passes them by the Flip ATR Buffer (the daily ATR's share), and alert
 			// with the zone's half-width as their band (NT:763-772).
 			const double flip = Valid(zoneAtr) ? zoneAtr * S->lvl_flip_atr : 0;
 			for (Level& l : Levels)
@@ -3968,26 +5282,29 @@ namespace
 			}
 			Cross(f, "IBH", ibH, S->ib_enable && S->ib_alert_ibh && !ib && InSession(b.Start, sess.ib_alert_time), false);
 			Cross(f, "IBL", ibL, S->ib_enable && S->ib_alert_ibl && !ib && InSession(b.Start, sess.ib_alert_time), false);
-			Cross(f, "OVN High", ovnH, S->amt_enable && S->amt_alert_ovn && !ovn, false);
-			Cross(f, "OVN Low", ovnL, S->amt_enable && S->amt_alert_ovn && !ovn, false);
+			// Each armed only while its line is drawn (OVN after its lines go, a section or a line switched off: 1.2.2).
+			const bool ovnDrawn = OvnDrawn(b.Start, ovn);
+			Cross(f, "OVN High", ovnH, ovnDrawn && S->amt_alert_ovn, false);
+			Cross(f, "OVN Low", ovnL, ovnDrawn && S->amt_alert_ovn, false);
 			Cross(f, "RTH VWAP", f.RthVwap, S->vwap_alert && vwin && pvwin, true);
-			Cross(f, "PDH", pdH, S->pd_alert_hl, false);
-			Cross(f, "PDL", pdL, S->pd_alert_hl, false);
-			Cross(f, "pwHigh", pwH, S->pw_alert_hl, false);
-			Cross(f, "pwLow", pwL, S->pw_alert_hl, false);
-			Cross(f, "Weekly Open", weekOpen, S->wk_alert_open, false);
-			Cross(f, "pdPOC", prevDay.Poc, S->cc_alert_va, false);
-			Cross(f, "pdVAH", prevDay.Vah, S->cc_alert_va, false);
-			Cross(f, "pdVAL", prevDay.Val, S->cc_alert_va, false);
-			const bool da = S->mvp_use_cur_alerts && InSession(b.Start, sess.mvp_alert_time);
-			Cross(f, "Developing POC", dev.Poc, da, true);
-			Cross(f, "Developing VAH", dev.Vah, da, true);
-			Cross(f, "Developing VAL", dev.Val, da, true);
-			Cross(f, "pmPOC", prevMonth.Poc, S->macro_alert_lvl, false);
-			Cross(f, "pmVAH", prevMonth.Vah, S->macro_alert_lvl, false);
-			Cross(f, "pmVAL", prevMonth.Val, S->macro_alert_lvl, false);
-			Cross(f, "pmHigh", pmH, S->macro_alert_lvl, false);
-			Cross(f, "pmLow", pmL, S->macro_alert_lvl, false);
+			Cross(f, "PDH", pdH, S->pd_alert_hl && S->pd_enable && S->pd_showH, false);
+			Cross(f, "PDL", pdL, S->pd_alert_hl && S->pd_enable && S->pd_showL, false);
+			Cross(f, "pwHigh", pwH, S->pw_alert_hl && S->pw_enable && S->pw_showH, false);
+			Cross(f, "pwLow", pwL, S->pw_alert_hl && S->pw_enable && S->pw_showL, false);
+			Cross(f, "Weekly Open", weekOpen, S->wk_alert_open && S->wk_showOpen, false);
+			const bool cc = S->cc_alert_va && S->cc_enable;
+			Cross(f, "pdPOC", prevDay.Poc, cc && S->cc_show_poc, false);
+			Cross(f, "pdVAH", prevDay.Vah, cc && S->cc_show_vah, false);
+			Cross(f, "pdVAL", prevDay.Val, cc && S->cc_show_val, false);
+			const bool da = S->mvp_use_cur_alerts && S->mvp_master && InSession(b.Start, sess.mvp_alert_time);
+			Cross(f, "Developing POC", dev.Poc, da && S->mvp_show_poc, true);
+			Cross(f, "Developing VAH", dev.Vah, da && S->mvp_show_vah, true);
+			Cross(f, "Developing VAL", dev.Val, da && S->mvp_show_val, true);
+			Cross(f, "pmPOC", prevMonth.Poc, S->macro_alert_lvl && S->macro_show_poc, false);
+			Cross(f, "pmVAH", prevMonth.Vah, S->macro_alert_lvl && S->macro_show_month, false);
+			Cross(f, "pmVAL", prevMonth.Val, S->macro_alert_lvl && S->macro_show_month, false);
+			Cross(f, "pmHigh", pmH, S->macro_alert_lvl && S->macro_show_hl, false);
+			Cross(f, "pmLow", pmL, S->macro_alert_lvl && S->macro_show_hl, false);
 			if (table && !Was(sess.tbl_session))
 			{
 				tableH = b.High;
@@ -4000,7 +5317,7 @@ namespace
 			}
 			PruneStructures();
 			rowsPruned = rowsPruned || day.PrunedRows > 0 || main->PrunedRows > 0 || macro.PrunedRows > 0 || nd.PrunedRows > 0 || nw.PrunedRows > 0
-				|| nm.PrunedRows > 0;
+				|| nm.PrunedRows > 0 || mm.PrunedRows > 0;
 			BuildVisuals(f, dev, zoneAtr, table, ovn, full);
 			if (rowsPruned)
 				f.Warning += " Row limit reached: oldest rows pruned; profile/TPO values use retained rows.";
@@ -4029,11 +5346,16 @@ namespace
 				removeLive();
 				tpoPeriod = -1;
 				spStep = BlockStep(rowMult);
+				tpoH = tpoL = NaN;
 			}
-			const int pid = MinuteOfDay(b.Start) / (std::max)(1, S->sp_tpo_minutes);
+			// periods on the clock (:00/:30) on ES's hours; on an instrument's own they move as its TPO Session did
+			// (TpoShift), so they fall in it as on ES: GC's 0830-1500 runs 07:20-12:30, its periods 07:20-07:50... (1.2.4)
+			const int pid = ((MinuteOfDay(b.Start) - S->TpoShift) % 1440 + 1440) % 1440 / (std::max)(1, S->sp_tpo_minutes);
 			const bool newPeriod = active && pid != tpoPeriod;
 			if (active)
 			{
+				tpoH = Max(tpoH, b.High);
+				tpoL = Min(tpoL, b.Low);
 				int64_t lo = (int64_t)std::floor(b.Low / spStep), hi = (int64_t)std::floor(b.High / spStep);
 				if (hi - lo + 1 > S->MaxProfileRows)
 				{
@@ -4100,7 +5422,8 @@ namespace
 				}
 				if (S->sp_show_poor)
 				{
-					const double hp = (double)(high + 1) * spStep, lp = (double)low * spStep;
+					// At the session's high and low (1.2.2: the high was drawn a block above it, one tick on ES).
+					const double hp = tpoH, lp = tpoL;
 					// One poor high (low) per price within two effective ticks.
 					auto known = [this](bool isHigh, double price)
 					{
@@ -4129,18 +5452,23 @@ namespace
 					}
 				}
 			}
+			// A single print fills when a bar trades in its row [Bottom, Top): its price traded from below fills it too (1.2.2).
 			const int64_t now = b.Start;
 			single.erase(std::remove_if(single.begin(), single.end(), [&](const ZoneItem& x)
-				{ return (!x.Live && TotalDays(now - x.Created) > S->sp_max_days) || (x.Top > b.Low && x.Bottom < b.High); }), single.end());
+				{ return (!x.Live && TotalDays(now - x.Created) > S->sp_max_days) || (x.Top > b.Low && x.Bottom <= b.High); }), single.end());
 			poor.erase(std::remove_if(poor.begin(), poor.end(), [&](const Poor& x)
 				{ return TotalDays(now - x.Created) > S->sp_max_days || (x.High ? b.High > x.Price : b.Low < x.Price); }), poor.end());
 		}
 
-		// Dalton's day type, on every bar of 08:30-15:00 (NT:836-863): the IB is the reference range
-		// (the overnight range until it is set); a type once real holds for the day (auction).
+		// Dalton's day type, on every bar of the regular hours (RthSession, NT:836-863): today's IB is the reference range
+		// once complete (1.2.3: its start on or after the trade date's; the overnight range until then, whatever IB Calc
+		// Period is set); a type once real holds for the day (auction).
 		void Classify(const Bar& b, double vwap, double dailyAtr)
 		{
-			const double h = Valid(ibH) ? ibH : ovnH, l = Valid(ibL) ? ibL : ovnL;
+			// An IB Calc Period from 09:00 still held yesterday's IB at 08:30-08:59, and outside its window read as
+			// complete: Non-Trend Day before it began (1.2.2 and before).
+			const bool ibToday = Valid(ibH) && ibStart >= dayStart;
+			const double h = ibToday ? ibH : ovnH, l = ibToday ? ibL : ovnL;
 			dayH = Max(dayH, b.High);
 			dayL = Min(dayL, b.Low);
 			if (hasPrevious)
@@ -4160,8 +5488,10 @@ namespace
 			else if (Valid(h) && Valid(l))
 			{
 				const double range = dayH - dayL, ibRange = h - l, ext = ibRange > 0 ? range / ibRange : 0, pos = range > 0 ? (b.Close - dayL) / range : .5;
-				const bool bu = dayH > h, bd = dayL < l, cvh = b.Close > prevDay.Vah, cvl = b.Close < prevDay.Val;
-				const bool iu = dayH > pdH || (dayH > ovnH && cvh), id = dayL < pdL || (dayL < ovnL && cvl);
+				const bool bu = dayH > h, bd = dayL < l, cvh = b.Close > dayVa.Vah, cvl = b.Close < dayVa.Val;
+				// The pd high and low today's open was measured against (1.2.2).
+				const double ph = Valid(rthO) ? openH : pdH, pl = Valid(rthO) ? openL : pdL;
+				const bool iu = dayH > ph || (dayH > ovnH && cvh), id = dayL < pl || (dayL < ovnL && cvl);
 				bool tu = bu && pos > .75 && vwap > (h + l) / 2 && (otfUp >= 5 || iu) && ext > 1.5;
 				bool tl = bd && pos < .25 && vwap < (h + l) / 2 && (otfDn >= 5 || id) && ext > 1.5;
 				tu = tu || (iu && pos > .8 && ext > 2);
@@ -4194,8 +5524,8 @@ namespace
 					candidate = id || ext > 1.2 || cvl ? "Normal Variation (Down)" : "Normal Day (Balance)";
 					color = candidate.find("Down") != std::string::npos ? PAL_MAROON : PAL_GRAY;
 				}
-				else if (!InSession(b.Start, sess.ibWindow) || Valid(ibH))
-					candidate = "Non-Trend Day";
+				else if (ibToday)
+					candidate = "Non-Trend Day";	// the day inside today's IB; held before it starts and while it forms (1.2.3)
 				else
 					real = false;
 			}
@@ -4235,7 +5565,8 @@ namespace
 			f.Lines.push_back(l);
 		}
 
-		// The daily levels' zone half-width (NT:869): a share of the 14-day ATR, or ticks of the effective tick.
+		// The daily levels' zone half-width (NT:869): a share of the daily ATR (the Daily ATR Period's since 1.2.2), or ticks of
+		// the effective tick.
 		double LevelZoneHalfWidth(double zoneAtr) const
 		{
 			return S->lvl_zone_mode == "ATR %" && Valid(zoneAtr) ? zoneAtr * S->lvl_zone_atr_pct : S->lvl_zoneWidthTicks * Step;
@@ -4351,12 +5682,20 @@ namespace
 		}
 
 	private:
+		// OVN High/Low are drawn (and alert, 1.2.2) after the overnight session, until Delete OVN Lines At's time.
+		bool OvnDrawn(CtTime t, bool ovn) const
+		{
+			return S->amt_enable && !ovn && MinuteOfDay(t) < sess.amt_del_sess.A;
+		}
+
+		// Today's open against the pd values in force at it (after the close the pd lines are today's own, 1.2.2).
 		std::string OpenLocation() const
 		{
-			if (!Valid(rthO) || !Valid(pdH) || !Valid(pdL))
+			const ProfileStats& va = dayVa;
+			if (!Valid(rthO) || !Valid(openH) || !Valid(openL))
 				return "---";
-			return rthO > pdH ? "Above pdHigh" : rthO < pdL ? "Below pdLow" : rthO > prevDay.Vah ? "Above pdVAH" : rthO < prevDay.Val ? "Below pdVAL"
-				: Valid(prevDay.Vah) ? "Inside Value" : "---";
+			return rthO > openH ? "Above pdHigh" : rthO < openL ? "Below pdLow" : rthO > va.Vah ? "Above pdVAH" : rthO < va.Val ? "Below pdVAL"
+				: Valid(va.Vah) ? "Inside Value" : "---";
 		}
 
 		// The frame's lines, zones, profiles and dashboard (NT:933-1035), in NinjaTrader's order, which
@@ -4385,7 +5724,7 @@ namespace
 			}
 			// The overnight high and low from the RTH start until the Delete OVN Lines At time (NT:949-954).
 			// Not archived: a committed frame leaves them out.
-			if (full && S->amt_enable && !ovn && MinuteOfDay(now) < sess.amt_del_sess.A)
+			if (full && OvnDrawn(now, ovn))
 			{
 				const size_t n = f.Lines.size();
 				Line(f, "OVN High", ovnH, rthStart, S->amt_c_hi, S->amt_width, S->amt_style_in, S->amt_offset, S->amt_lb_size_in, S->amt_showLb, "None");
@@ -4393,27 +5732,30 @@ namespace
 				for (size_t i = n; i < f.Lines.size(); i++)
 					f.Lines[i].TextColor = f.Lines[i].Name == "OVN High" ? S->amt_c_txt_hi : S->amt_c_txt_lo;
 			}
-			// The prior day's high, low and open from the trading day's start (NT:955-960).
+			// The prior day's lines from the trade date's open, or from the close they switched at (the closed session's
+			// own, 1.2.2: the driver keeps the lines they replaced over the day before it) (NT:955-966).
+			const CtTime pdStart = pdRolledAt > dayStart ? pdRolledAt : dayStart, vaStart = vaRolledAt > dayStart ? vaRolledAt : dayStart,
+				hlStart = S->pd_use_rth ? pdStart : dayStart;
 			if (!full || S->pd_enable)
 			{
 				if (!full || S->pd_showH)
-					Line(f, "pdHigh", pdH, dayStart, S->pd_high_c, S->pd_high_width, S->pd_style_in, S->pd_offset_val, S->pd_lb_size_in, true, "None", S->pd_txt_c);
+					Line(f, "pdHigh", pdH, hlStart, S->pd_high_c, S->pd_high_width, S->pd_style_in, S->pd_offset_val, S->pd_lb_size_in, true, "None", S->pd_txt_c);
 				if (!full || S->pd_showL)
-					Line(f, "pdLow", pdL, dayStart, S->pd_low_c, S->pd_low_width, S->pd_style_in, S->pd_offset_val, S->pd_lb_size_in, true, "None", S->pd_txt_c);
+					Line(f, "pdLow", pdL, hlStart, S->pd_low_c, S->pd_low_width, S->pd_style_in, S->pd_offset_val, S->pd_lb_size_in, true, "None", S->pd_txt_c);
 				if (!full || S->pd_showOpen)
-					Line(f, "pdOpen", pdO, dayStart, S->pd_open_c, S->pd_open_width, S->pd_style_in, S->pd_offset_val, S->pd_lb_size_in, true, "None",
+					Line(f, "pdOpen", pdO, pdStart, S->pd_open_c, S->pd_open_width, S->pd_style_in, S->pd_offset_val, S->pd_lb_size_in, true, "None",
 						S->pd_txt_c);
 			}
 			if (S->cc_enable)
 			{
 				if (!full || S->cc_show_poc)
-					Line(f, "pdPOC", prevDay.Poc, dayStart, S->pd_poc_c, S->cc_poc_width, S->cc_poc_style_in, S->cc_lb_offset, S->cc_lb_size_in, true,
+					Line(f, "pdPOC", prevDay.Poc, vaStart, S->pd_poc_c, S->cc_poc_width, S->cc_poc_style_in, S->cc_lb_offset, S->cc_lb_size_in, true,
 						"None", S->cc_txt_c);
 				if (!full || S->cc_show_vah)
-					Line(f, "pdVAH", prevDay.Vah, dayStart, S->pd_vah_c, S->cc_vah_width, S->cc_poc_style_in, S->cc_lb_offset, S->cc_lb_size_in, true,
+					Line(f, "pdVAH", prevDay.Vah, vaStart, S->pd_vah_c, S->cc_vah_width, S->cc_poc_style_in, S->cc_lb_offset, S->cc_lb_size_in, true,
 						"None", S->cc_txt_c);
 				if (!full || S->cc_show_val)
-					Line(f, "pdVAL", prevDay.Val, dayStart, S->pd_val_c, S->cc_val_width, S->cc_poc_style_in, S->cc_lb_offset, S->cc_lb_size_in, true,
+					Line(f, "pdVAL", prevDay.Val, vaStart, S->pd_val_c, S->cc_val_width, S->cc_poc_style_in, S->cc_lb_offset, S->cc_lb_size_in, true,
 						"None", S->cc_txt_c);
 			}
 			// The RTH open from the RTH start (NT:967); archived with the day's lines.
@@ -4421,7 +5763,7 @@ namespace
 				Line(f, "dOpen", rthO, rthStart, S->cc_c_open, S->cc_open_width, S->cc_open_style, S->cc_open_offset, S->cc_open_lb_size, true, "None",
 					S->opens_txt_c);
 			if (!full)
-				return;		// a committed frame: only what the archive and PdRolled read (spec C.4)
+				return;		// a committed frame: only what the archive reads (spec C.4)
 			// The weekly open from the week's start (NT:968).
 			if (S->wk_showOpen)
 				Line(f, "wkOpen", weekOpen, weekStart, S->wk_c_open, S->wk_open_width, S->wk_open_style, S->wk_open_offset, S->wk_open_lb_size, true, "None",
@@ -4602,6 +5944,20 @@ namespace
 		}
 	};
 
+	// A zone's half-width at the instrument's decimals, not snapped to a tick (NinjaTrader 1.2.2's MathEx.Width: an
+	// ATR zone's half-width of 1.117 read 1.00 on ES before), at most 4 decimals, in .NET's "F" format.
+	std::string WidthText(double width, double tick)
+	{
+		int decimals = 0;
+		double q = tick;
+		while (decimals < 8 && std::fabs(q - std::nearbyint(q)) > 1e-8)
+		{
+			q *= 10;
+			decimals++;
+		}
+		return FormatNet(width, (std::min)(4, decimals), true);
+	}
+
 	// Live observations, independent of the engine's speculative copies (NT:1372-1400).
 	struct LevelAlertTracker
 	{
@@ -4639,7 +5995,7 @@ namespace
 					const bool wasInside = std::fabs(p.Close - p.Center) <= p.Width;
 					const bool inside = std::fabs(close - l.Price) <= l.HalfWidth;
 					if ((mode == "Zone Entry" || mode == "Both") && !wasInside && inside)
-						result.push_back({l.Name + "Zone", l.Name + " Zone Entry @ " + text(l.Price) + " (\xC2\xB1" + text(l.HalfWidth) + ")"});
+						result.push_back({l.Name + "Zone", l.Name + " Zone Entry @ " + text(l.Price) + " (\xC2\xB1" + WidthText(l.HalfWidth, tick) + ")"});
 				}
 				Point next;
 				next.Close		= close;
@@ -4681,51 +6037,20 @@ namespace
 		return s;
 	}
 
-	// pdHigh, pdLow and pdOpen: the lines that roll at 15:00 (NinjaTrader's IsRollingPd, NT:1634).
-	const char* const ROLLING_PD[3] = {"pdHigh", "pdLow", "pdOpen"};
-
-	int RollingPdIndex(const std::string& name)
+	// The trades NinjaTrader 1.2.0-1.2.3 downloads (BarsRequest of 1-tick bars) and takes live (OnMarketData), per CT
+	// minute: each traded price's volume. Sierra Chart: the chart's own intraday file (TickStore); tests: vectors.
+	struct TradeSource
 	{
-		for (int k = 0; k < 3; k++)
-			if (name == ROLLING_PD[k])
-				return k;
-		return -1;
-	}
+		// The minute's trades (price ascending, each price once); false when none are known (not read, none, or not
+		// single trades: records of several trades).
+		virtual bool Minute(CtTime minute, PriceVolumes& out) const = 0;
+		// Every trade before this CT time is read (CT_MIN: none yet).
+		virtual CtTime ReadThrough() const = 0;
+		// Every trade in [from, to) can be read as single trades (the source covers it, no record of several trades).
+		virtual bool Ticks(CtTime from, CtTime to) const = 0;
 
-	bool IsRollingPd(const LineItem& x)
-	{
-		return RollingPdIndex(x.Name) >= 0;
-	}
-
-	// Which of pdHigh, pdLow and pdOpen are shown (bits 0, 1, 2): NinjaTrader's frames hold only the
-	// shown ones, and its PdRolled (NT:1635-1643) compares only those, so its archive depends on them.
-	int PdCombination(bool high, bool low, bool open)
-	{
-		return (high ? 1 : 0) | (low ? 2 : 0) | (open ? 4 : 0);
-	}
-
-	// Whether one rolling line changed price between two frames (NinjaTrader's PdRolled, line by line).
-	bool PdLineRolled(const Frame& a, const Frame& b, const char* name)
-	{
-		for (const LineItem& x : a.Lines)
-			if (x.Name == name)
-			{
-				for (const LineItem& y : b.Lines)
-					if (y.Name == name)
-						return std::fabs(y.Price - x.Price) > 1e-9;
-				return false;
-			}
-		return false;
-	}
-
-	// An archived day line (NT:1843) and the pdHigh/pdLow/pdOpen combinations (PdCombination) whose
-	// NinjaTrader archive holds it: the drawing shows it under the combination shown now (spec C.4).
-	struct ArchivedLine
-	{
-		LineItem	Line;
-		uint8_t		Sets	= 0xFF;
-
-		bool In(int combination) const { return ((Sets >> combination) & 1) != 0; }
+	protected:
+		~TradeSource() = default;
 	};
 
 	// One minute as a source gives it: its START in chart time (microseconds) and its tick-snapped
@@ -5020,19 +6345,36 @@ namespace
 		int									NextBar		= 0;	// the first chart bar not yet committed (or skipped)
 		MacroCursor							Macro;
 		std::deque<Sample>					Samples;		// committed bars (NinjaTrader's RenderHistory, 50,000)
-		std::vector<ArchivedLine>			History;		// archived day lines (NT:1835-1847)
+		std::vector<LineItem>				History;		// archived day lines (NinjaTrader's historicalLines)
+		// The last commit that kept each kind of day line (NinjaTrader cuts its archive to 20 days at every commit that
+		// keeps a line it draws: ArchiveShows).
+		std::map<std::string, CtTime>		LastKeep;
 		bool								HasPrevFrame	= false;
 		Frame								PrevFrame;
-		// NinjaTrader's pdBeforeRoll (NT:1838), per rolling line (ROLLING_PD): within the trading date,
-		// the commit that first changed its price (Moment) and the frame before it's rolling lines.
-		struct PdCapture
-		{
-			bool					Has		= false;
-			int						Moment	= 0;
-			std::vector<LineItem>	Lines;
-		};
-		std::array<PdCapture, 3>			PdRolls;
 		std::vector<int>					Seqs;			// each chart bar's Seq (Bar.Seq), this call's
+		// The trades (NinjaTrader 1.2.0-1.2.3): the indicator's two properties, the trades source, and what the load and
+		// the live closes asked of it (NinjaTrader's tickDays and periodTicks; a request is answered when the source has
+		// read through its end: NinjaTrader's download coming in).
+		struct TickDay
+		{
+			CtTime	Start	= 0;
+			CtTime	End		= 0;
+			bool	Done	= false;
+			bool	Ok		= false;
+		};
+		int									PdTickSessions	= 5;		// 4. Previous Day Value & 80% Rule: Value From Ticks (Sessions)
+		bool								ProfileTicks	= true;		// 11. Volume Profile: Profile From Ticks
+		const TradeSource*					Trades			= nullptr;
+		std::vector<TickDay>				TickDays;
+		bool								HasPeriod		= false;
+		CtTime								PeriodStart		= 0;
+		CtTime								PeriodEnd		= 0;
+		CtTime								PeriodAsked		= 0;		// the load's time: the download holds the trades until then
+		bool								PeriodDone		= false;
+		bool								TickArrived		= false;
+		int									LastBarSeen		= -1;		// the newest chart bar of the last call (NinjaTrader's IsFirstTickOfBar)
+		mutable int							TickValues		= 0;		// sessions and minutes given from trades (tests)
+		mutable int							TickMinutes		= 0;
 		AlertState							Alerts;
 		// The newest preview: the frame drawn and the samples of the uncommitted bars.
 		bool								HasView		= false;
@@ -5053,9 +6395,14 @@ namespace
 			Macro			= MacroCursor();
 			Samples.clear();
 			History.clear();
+			LastKeep.clear();
 			HasPrevFrame	= false;
 			PrevFrame		= Frame();
-			PdRolls			= std::array<PdCapture, 3>();
+			TickDays.clear();
+			HasPeriod		= false;
+			PeriodDone		= false;
+			TickArrived		= false;
+			LastBarSeen		= -1;
 			Alerts.Reset();
 			HasView			= false;
 			View			= Frame();
@@ -5082,72 +6429,291 @@ namespace
 			return f;
 		}
 
-		// The ended trading date's lines into the archive (NT:1839-1847): the IB lines, dOpen and the pd
-		// lines of its last frame, with pdHigh/pdLow/pdOpen as they stood before the 15:00 roll. For
-		// each combination of shown rolling lines, NinjaTrader's roll is the earliest first change among
-		// them; the rolled lines (their capture, after the others as NinjaTrader appends them) and the
-		// unrolled ones (in frame order) carry the combinations they belong to. Then the 20-day cut.
-		void ArchiveDay(CtTime newStart)
+		// ---- The trades (NinjaTrader 1.2.0-1.2.3's driver) ----
+
+		// The RTH Session for VA's window on a date (NinjaTrader's RthWindow): false on a day it does not trade.
+		bool RthWindow(int date, CtTime& start, CtTime& end) const
 		{
-			int roll[8];
-			for (int set = 0; set < 8; set++)
-			{
-				roll[set] = -1;
-				for (int k = 0; k < 3; k++)
-					if (((set >> k) & 1) != 0 && PdRolls[(size_t)k].Has && (roll[set] < 0 || PdRolls[(size_t)k].Moment < PdRolls[(size_t)roll[set]].Moment))
-						roll[set] = k;
-			}
-			// The combinations holding line k: unrolled (capture < 0), or rolled at that capture's moment.
-			auto setsOf = [&](int k, int capture)
-			{
-				uint8_t sets = 0;
-				for (int set = 0; set < 8; set++)
-					if (((set >> k) & 1) != 0 && (capture < 0 ? roll[set] < 0
-						: roll[set] >= 0 && PdRolls[(size_t)roll[set]].Moment == PdRolls[(size_t)capture].Moment))
-						sets = (uint8_t)(sets | (1u << set));
-				return sets;
-			};
-			auto archive = [this](const LineItem& x, uint8_t sets)
-			{
-				if (sets == 0)
-					return;
-				ArchivedLine a;
-				a.Line.Name		= x.Name;
-				a.Line.Price	= x.Price;
-				a.Line.Start	= x.Start;
-				a.Line.End		= x.End;
-				a.Line.Color	= x.Color;
-				a.Line.Width	= x.Width;
-				a.Line.Style	= x.Style;
-				a.Line.Label	= false;
-				a.Sets			= sets;
-				History.push_back(a);
-			};
-			for (const LineItem& x : PrevFrame.Lines)
-			{
-				const int k = RollingPdIndex(x.Name);
-				if (k >= 0)
-					archive(x, setsOf(k, -1));
-				else if (StartsWith(x.Name, "IB ") || x.Name == "dOpen" || StartsWith(x.Name, "pd"))
-					archive(x, 0xFF);
-			}
-			for (int c = 0; c < 3; c++)
-			{
-				bool repeated = false;
-				for (int e = 0; e < c; e++)
-					repeated = repeated || (PdRolls[(size_t)e].Has && PdRolls[(size_t)c].Has && PdRolls[(size_t)e].Moment == PdRolls[(size_t)c].Moment);
-				if (!PdRolls[(size_t)c].Has || repeated)
-					continue;
-				for (const LineItem& x : PdRolls[(size_t)c].Lines)
-					archive(x, setsOf(RollingPdIndex(x.Name), c));
-			}
-			PdRolls = std::array<PdCapture, 3>();
-			History.erase(std::remove_if(History.begin(), History.end(), [newStart](const ArchivedLine& a) { return TotalDays(newStart - a.Line.End) > 20; }),
-				History.end());
+			SessionSpec s;
+			ParseSession(Cfg.cc_sess_def, s);
+			start	= CtAt(date, s.A * 60);
+			end		= s.B > s.A ? CtAt(date, s.B * 60) : CtAt(date + 1, s.B * 60);
+			return InSession(start, s);
 		}
 
-		// NinjaTrader's Commit (NT:1830-1851): drain the 30-minute bars, process the bar once, archive
-		// the day lines at a new trading date, keep the sample, emit the bar's notices.
+		// A session's trades, asked for (NinjaTrader's RequestTickDay): answered at once when the source has read
+		// through its end (NinjaTrader's download came in), else when it has (UpdateArrivals).
+		void RequestTickDay(CtTime start, CtTime end)
+		{
+			for (const TickDay& x : TickDays)
+				if (x.Start == start)
+					return;
+			TickDay day;
+			day.Start	= start;
+			day.End		= end;
+			TickDays.push_back(day);
+			UpdateArrivals();
+		}
+
+		// At the load: the last PdTickSessions RTH sessions that ended by `now` (CT), within 45 days (NinjaTrader's
+		// RequestTickDays at State.DataLoaded, from NinjaTrader.Core.Globals.Now). Today's is asked for when it closes.
+		void RequestTickDays(CtTime now)
+		{
+			if (!Cfg.cc_enable || PdTickSessions <= 0)
+				return;
+			int found = 0;
+			for (int d = DateOfCt(now); found < PdTickSessions && d > DateOfCt(now) - 45; d--)
+			{
+				CtTime start = 0, end = 0;
+				if (!RthWindow(d, start, end) || end > now)
+					continue;
+				RequestTickDay(start, end);
+				found++;
+			}
+		}
+
+		// Live, a chart bar's first update within two hours after the RTH Session for VA closed asks for that session
+		// (NinjaTrader's RequestClosedSession on IsFirstTickOfBar). Deliberate difference: the session's trades are in the
+		// tick file by then, so it is answered at once and the close's switch uses them (NinjaTrader's download takes a few
+		// seconds, and its preview shows the 1-minute value meanwhile).
+		void RequestClosedSession(CtTime barStart)
+		{
+			CtTime start = 0, end = 0;
+			if (RthWindow(DateOfCt(barStart), start, end) && barStart >= end && barStart < end + 2 * 3600)
+				RequestTickDay(start, end);
+		}
+
+		// NinjaTrader's 1-minute series as its load holds it (BarsArray[1], which RequestPeriodTicks reads, 1.2.3): the
+		// minutes starting by the load's time `now` (the forming one too, as Sierra Chart's chart holds it), each stamped
+		// at its CT close (start + 60 s, NinjaTrader's stamp). A replay's hidden chart already holds the minutes after the
+		// replay's time; NinjaTrader's series has none of them, so they are left out.
+		struct LoadedMinutes
+		{
+			const MinuteSource*	Source	= nullptr;
+			const CtClock*		Clock	= nullptr;
+			int64_t				Last	= -1;		// the newest minute starting by now (-1: none)
+
+			LoadedMinutes(const MinuteSource* source, const CtClock* clock, CtTime now) : Source(source), Clock(clock)
+			{
+				if (source == nullptr || clock == nullptr)
+					return;
+				for (int64_t k = source->Count() - 1; k >= 0 && Last < 0; k--)
+				{
+					const MinuteRec r = source->At(k);
+					if (!r.Empty && clock->Of(r.M) <= now)
+						Last = k;
+				}
+			}
+
+			// The newest minute's close (NinjaTrader's BarsArray[1].GetTime(Count - 1)); false when there is none.
+			bool Newest(CtTime& close) const
+			{
+				if (Last < 0)
+					return false;
+				close = Clock->Of(Source->At(Last).M) + 60;
+				return true;
+			}
+
+			// NinjaTrader's HasMinute: a minute ending in (a, b] (CT), the window held trading. From the newest back, as
+			// NinjaTrader reads its series.
+			bool Has(CtTime a, CtTime b) const
+			{
+				for (int64_t k = Last; k >= 0; k--)
+				{
+					const MinuteRec r = Source->At(k);
+					if (r.Empty)
+						continue;
+					const CtTime t = Clock->Of(r.M) + 60;
+					if (t <= a)
+						return false;
+					if (t <= b)
+						return true;
+				}
+				return false;
+			}
+		};
+
+		// Whether the load asks for the current profile's trades (NinjaTrader's RequestPeriodTicks): Profile From Ticks on
+		// and a Session or Weekly profile shown.
+		bool AsksPeriod() const
+		{
+			return ProfileTicks && Cfg.mvp_master && (Cfg.mvp_tf_mode == "Session" || Cfg.mvp_tf_mode == "Weekly");
+		}
+
+		// At the load: the current Session or Weekly profile's trades from its start, the week's Sunday 17:00 open or the
+		// Session Time window that began last with trading in it (NinjaTrader's RequestPeriodTicks, 1.2.3: over a weekend
+		// or a holiday the profile shown is still the one before, Friday's on Monday morning); later minutes from the live
+		// trades. `minutes`, `clock`: the 1-minute bars as the load has them (LoadedMinutes).
+		void RequestPeriodTicks(CtTime now, const MinuteSource* minutes, const CtClock* clock)
+		{
+			if (!AsksPeriod())
+				return;
+			CtTime start = 0, end = now;
+			if (Cfg.mvp_tf_mode == "Weekly")
+				start = CtAt(WeekOf(TradingDate(now)) - 1, 17 * 3600);
+			else
+			{
+				SessionSpec s;
+				ParseSession(Cfg.mvp_sess_time, s);
+				start = CtAt(DateOfCt(now), s.A * 60);
+				if (start > now)
+					start -= SECONDS_DAY;
+				const CtTime len = (CtTime)(s.B > s.A ? s.B - s.A : s.B + 1440 - s.A) * 60;
+				// Today's while it is open and trading now, or just began: in its first minutes no 1-minute bar of it may
+				// have closed yet, after a halt (a 1700 window) none for an hour.
+				const LoadedMinutes loaded(minutes, clock, now);
+				CtTime newest = 0;
+				const bool trading = now < start + len && (now < start + 180 || (loaded.Newest(newest) && newest > now - 180));
+				for (int back = 0; back < 7; back++)
+				{
+					const CtTime from = start - (CtTime)back * SECONDS_DAY;
+					if ((back == 0 && trading) || loaded.Has(from, from + len))
+					{
+						start = from;
+						break;
+					}
+				}
+				const CtTime close = start + len;
+				if (close < end)
+					end = close;
+			}
+			HasPeriod	= true;
+			PeriodStart	= start;
+			PeriodEnd	= end + 5 * 60;
+			PeriodAsked	= now;
+			PeriodDone	= false;
+			UpdateArrivals();
+		}
+
+		// Where the trades must be read from for a load at `now` (CT): the earliest of the sessions and the period it asks
+		// for, and of today's RTH Session for VA when `now` is inside it (asked for when it closes). CT_MIN: none.
+		CtTime TicksFrom(CtTime now, const MinuteSource* minutes, const CtClock* clock)
+		{
+			const std::vector<TickDay> days = TickDays;
+			const bool hasPeriod = HasPeriod, periodDone = PeriodDone, arrived = TickArrived;
+			const CtTime periodStart = PeriodStart, periodEnd = PeriodEnd, periodAsked = PeriodAsked;
+			const TradeSource* trades = Trades;
+			Trades = nullptr;
+			TickDays.clear();
+			HasPeriod = false;
+			RequestTickDays(now);
+			RequestPeriodTicks(now, minutes, clock);
+			CtTime from = CT_MIN;
+			auto earliest = [&from](CtTime t) { from = from == CT_MIN ? t : (std::min)(from, t); };
+			for (const TickDay& d : TickDays)
+				earliest(d.Start);
+			if (HasPeriod)
+				earliest(PeriodStart);
+			if (Cfg.cc_enable && PdTickSessions > 0)
+				for (int date = DateOfCt(now) - 1; date <= DateOfCt(now); date++)
+				{
+					CtTime start = 0, end = 0;
+					if (RthWindow(date, start, end) && start <= now && now < end)
+						earliest(start);
+				}
+			TickDays	= days;
+			HasPeriod	= hasPeriod;
+			PeriodDone	= periodDone;
+			TickArrived	= arrived;
+			PeriodStart	= periodStart;
+			PeriodEnd	= periodEnd;
+			PeriodAsked	= periodAsked;
+			Trades		= trades;
+			return from;
+		}
+
+		// The requests the source has now read through: answered (NinjaTrader's TickDayLoaded and PeriodTicksLoaded). A
+		// session coming in sets TickArrived (PatchPrevDay).
+		void UpdateArrivals()
+		{
+			const CtTime through = Trades != nullptr ? Trades->ReadThrough() : CT_MIN;
+			for (TickDay& day : TickDays)
+				if (!day.Done && through >= day.End)
+				{
+					day.Done	= true;
+					day.Ok		= Trades->Ticks(day.Start, day.End);
+					TickArrived	= true;
+				}
+			if (HasPeriod && !PeriodDone && through >= PeriodAsked)
+				PeriodDone = true;
+		}
+
+		// Engine.TradeValue (NinjaTrader's TickValue): the session's trades in [first, end), or false for its minutes (not
+		// read yet, an older day, not single trades, or fewer contracts than its 1-minute bars: incomplete). NinjaTrader's
+		// load waits up to 60 s for a session asked for; here the study reads the tick file before it builds the engine,
+		// waiting as long at most (TicksWait).
+		bool TickValue(CtTime first, CtTime end, double minuteVolume, PriceVolumes& out) const
+		{
+			if (Trades == nullptr)
+				return false;
+			const TickDay* day = nullptr;
+			for (const TickDay& x : TickDays)
+				if (x.Start <= first && end <= x.End)
+				{
+					day = &x;
+					break;
+				}
+			if (day == nullptr || !day->Done || !day->Ok)
+				return false;
+			std::map<double, double> sum;
+			double total = 0;
+			PriceVolumes minute;
+			for (CtTime m = FloorDiv(first, 60) * 60; m < end; m += 60)
+				if (m >= first && Trades->Minute(m, minute))
+					for (const auto& x : minute)
+					{
+						double& v = sum[x.first];
+						v = v + x.second;
+						total += x.second;
+					}
+			if (!(total >= minuteVolume * 0.99 && total > 0))
+				return false;
+			out.assign(sum.begin(), sum.end());
+			TickValues++;
+			return true;
+		}
+
+		// Engine.MinuteTrades (NinjaTrader's MinuteTradesFor): the minute's trades when they add up to its 1-minute bar's
+		// volume, else false (before the current period at the load, not read yet, or not single trades). Deliberate
+		// difference: NinjaTrader drops the live trades that come while its period download runs (those minutes use
+		// their bars); the tick file holds them all.
+		bool MinuteTradesFor(CtTime minute, double volume, PriceVolumes& out) const
+		{
+			if (volume <= 0 || Trades == nullptr || !HasPeriod || minute < PeriodStart || !PeriodDone)
+				return false;
+			if (!Trades->Minute(minute, out))
+				return false;
+			double total = 0;
+			for (const auto& x : out)
+				total += x.second;
+			const bool all = total >= volume * 0.99 && total <= volume * 1.01;
+			TickMinutes += all ? 1 : 0;
+			return all;
+		}
+
+		// A session that came in after its roll (NinjaTrader's PatchPrevDay): the current pd value from its trades;
+		// before the close's roll today's 80% Rule fill was drawn from the minutes' value area, so it is cleared and
+		// drawn again from here on. True when the value changed.
+		bool PatchPrevDay()
+		{
+			if (!TickArrived || !Committed)
+				return false;
+			TickArrived = false;
+			if (!Committed->RefreshPrevDay())
+				return false;
+			if (!Committed->ValueRolled())
+			{
+				const CtTime from = Committed->DayStart();
+				Samples.erase(std::remove_if(Samples.begin(), Samples.end(), [from](const Sample& x) { return x.Start >= from; }), Samples.end());
+			}
+			return true;
+		}
+
+		// NinjaTrader's Commit (NT:1830-1851, 1.2.2): drain the 30-minute bars, process the bar once, keep the day lines
+		// (a pd line that switched to the closed session at its close starts there from then on: kept as it stood over
+		// the day before it, at once; a finished day's IB, open and pd lines at the next trade date), keep the sample,
+		// emit the bar's notices. The committed frames hold every day line whatever is shown (spec C.4): each line is
+		// kept by its own start, so the archive shows the lines shown now as NinjaTrader's would hold them.
 		void Commit(const CallInput& in, int i)
 		{
 			const std::vector<ChartBar>& bars = *in.Bars;
@@ -5155,25 +6721,47 @@ namespace
 			const std::vector<Bar> subs = SubbarsOf(in.Minutes, bars[(size_t)i], *in.Clock, MinutesUsed, in.ReadLimitUs);
 			Frame f = CalculateFrame(*Committed, EngineBar(bars, i, Seqs[(size_t)i]), subs, CommitFull);
 			const bool sameDay = HasPrevFrame && TradingDate(PrevFrame.Bar.Start) == TradingDate(f.Bar.Start);
-			// pdHigh, pdLow and pdOpen switch to the session that just closed at 15:00. Keep the lines as they
-			// stood before that switch, so each day's history shows the values that were in force during that day.
-			// NinjaTrader keeps them at the first change of a line it draws (PdRolled over its shown lines,
-			// NT:1838); the committed frames here hold all three (spec C.4), so each line's first change is
-			// kept and ArchiveDay writes the archive of every combination of shown lines.
+			size_t kept = 0;
+			auto keep = [this, &kept, &f](const LineItem& x)
+			{
+				LastKeep[x.Name] = f.Bar.Start;
+				LineItem l;
+				l.Name	= x.Name;
+				l.Price	= x.Price;
+				l.Start	= x.Start;
+				l.End	= x.End;
+				l.Color	= x.Color;
+				l.Width	= x.Width;
+				l.Style	= x.Style;
+				l.Label	= false;
+				History.push_back(l);
+				kept++;
+			};
 			if (sameDay)
-				for (int k = 0; k < 3; k++)
-					if (!PdRolls[(size_t)k].Has && PdLineRolled(PrevFrame, f, ROLLING_PD[k]))
-					{
-						PdCapture& c = PdRolls[(size_t)k];
-						c.Has		= true;
-						c.Moment	= Commits;
-						c.Lines.clear();
-						for (const LineItem& x : PrevFrame.Lines)
-							if (IsRollingPd(x))
-								c.Lines.push_back(x);
-					}
-			if (HasPrevFrame && !sameDay)
-				ArchiveDay(f.Bar.Start);
+			{
+				for (const LineItem& x : PrevFrame.Lines)
+					if (StartsWith(x.Name, "pd"))
+						for (const LineItem& y : f.Lines)
+							if (y.Name == x.Name && y.Start != x.Start)
+							{
+								keep(x);
+								break;
+							}
+			}
+			else if (HasPrevFrame)
+			{
+				for (const LineItem& x : PrevFrame.Lines)
+					if (StartsWith(x.Name, "IB ") || x.Name == "dOpen" || StartsWith(x.Name, "pd"))
+						keep(x);
+			}
+			// NinjaTrader cuts its archive to 20 days whenever it keeps a line it draws, so which old lines it still has
+			// depends on the lines shown (ArchiveShows decides at drawing time); the lines far older than any of that go.
+			if (kept > 0)
+			{
+				const CtTime newStart = f.Bar.Start;
+				History.erase(std::remove_if(History.begin(), History.end(), [newStart](const LineItem& a) { return TotalDays(newStart - a.End) > 40; }),
+					History.end());
+			}
 			Samples.push_back(ToSample(f));
 			while (Samples.size() > MAX_SAMPLES)
 				Samples.pop_front();
@@ -5217,24 +6805,71 @@ namespace
 					first++;
 				Committed.reset(new Engine(&Cfg, Root, Tick, bars[(size_t)first].Close, Minutes));
 				Committed->PriceText = PriceText;
+				// NinjaTrader sets the engine's trade hooks as it makes it: the prior day's always, the current
+				// profile's with Profile From Ticks on (1.2.0, 1.2.2).
+				Committed->TradeValue = [this](CtTime first, CtTime end, double minuteVolume, PriceVolumes& out)
+				{
+					return TickValue(first, end, minuteVolume, out);
+				};
+				if (ProfileTicks)
+					Committed->MinuteTrades = [this](CtTime minute, double volume, PriceVolumes& out) { return MinuteTradesFor(minute, volume, out); };
 			}
 			if (in.Live && Alerts.FirstLiveBar == INT_MAX)
 				Alerts.FirstLiveBar = lastReal;
-			for (; NextBar < lastReal; NextBar++)
+			// The trades read since the last call: a session that came in now (NinjaTrader: its download answered) refreshes
+			// the pd value live (PatchPrevDay; NinjaTrader's State.Realtime runs it once too). Historical calls keep it for
+			// the first live one.
+			UpdateArrivals();
+			if (in.Live)
+				PatchPrevDay();
+			// Commit every completed bar before `limit` the minutes have moved past.
+			auto commitBefore = [this, &in, &bars](int limit)
 			{
-				const ChartBar& b = bars[(size_t)NextBar];
-				if (b.Empty)
-					continue;
-				if (in.Gate)
+				for (; NextBar < limit; NextBar++)
 				{
-					const int64_t count = in.Minutes != nullptr ? in.Minutes->Count() : 0;
-					if (count == 0 || in.Minutes->At(count - 1).M < b.Eu)
-						break;
+					const ChartBar& b = bars[(size_t)NextBar];
+					if (b.Empty)
+						continue;
+					if (in.Gate)
+					{
+						const int64_t count = in.Minutes != nullptr ? in.Minutes->Count() : 0;
+						if (count == 0 || in.Minutes->At(count - 1).M < b.Eu)
+							break;
+					}
+					Commit(in, NextBar);
 				}
-				Commit(in, NextBar);
-			}
+			};
+			// Live, a new chart bar's first update commits the bar before it and asks for the session that closed before
+			// it (NinjaTrader's RequestClosedSession on IsFirstTickOfBar); a session it gets at once refreshes the pd value
+			// before the next bar's (NinjaTrader's PatchPrevDay, a custom event after the update). A historical call
+			// only notes the newest bar.
+			if (in.Live && LastBarSeen >= 0)
+				for (int j = LastBarSeen + 1; j <= lastReal; j++)
+				{
+					if (bars[(size_t)j].Empty)
+						continue;
+					commitBefore(j);
+					if (Cfg.cc_enable && PdTickSessions > 0)
+						RequestClosedSession(bars[(size_t)j].S);
+					if (j < lastReal)
+						PatchPrevDay();
+				}
+			commitBefore(lastReal);
+			LastBarSeen = lastReal;
 			if (in.BeforePreview)
 				in.BeforePreview();
+			Preview(in, lastReal);
+			// The sessions those requests got at once (NinjaTrader runs PatchPrevDay after the event that asked, then
+			// previews again).
+			if (in.Live && PatchPrevDay())
+				Preview(in, lastReal);
+		}
+
+		// NinjaTrader's Preview (NT:1852-1858): the bars after the committed ones on a copy of the engine; the last
+		// bar's frame is drawn.
+		void Preview(const CallInput& in, int lastReal)
+		{
+			const std::vector<ChartBar>& bars = *in.Bars;
 			int j0 = NextBar;
 			while (j0 < lastReal && bars[(size_t)j0].Empty)
 				j0++;
@@ -5258,6 +6893,202 @@ namespace
 			HasView = true;
 			Previews++;
 			EmitAlerts(Alerts, Cfg, View, false, in.Live, Tick, PriceText, in.Send);
+		}
+	};
+
+	// Whether a day line kind of the archive is drawn with these settings (NinjaTrader's frames hold only the lines
+	// drawn; the committed frames here hold them all, spec C.4).
+	bool ArchiveKindShown(const Settings& s, const std::string& n)
+	{
+		return n == "IB Midpoint" ? s.ib_show_mid : n == "pdPOC" ? s.cc_show_poc : n == "pdVAH" ? s.cc_show_vah : n == "pdVAL" ? s.cc_show_val
+			: n == "dOpen" ? s.cc_showOpen : n == "pdHigh" ? s.pd_enable && s.pd_showH : n == "pdLow" ? s.pd_enable && s.pd_showL
+			: n == "pdOpen" ? s.pd_enable && s.pd_showOpen : true;
+	}
+
+	// An archived line NinjaTrader holds with these settings: its kind drawn, and not cut: NinjaTrader cuts the lines
+	// ending over 20 days before a commit that kept a line it draws (1.2.2's Commit), so the last such commit of a
+	// shown kind decides.
+	bool ArchiveShows(const AmtCore& core, const Settings& s, const LineItem& line)
+	{
+		if (!ArchiveKindShown(s, line.Name))
+			return false;
+		CtTime last = CT_MIN;
+		for (const auto& k : core.LastKeep)
+			if (ArchiveKindShown(s, k.first))
+				last = (std::max)(last, k.second);
+		return last == CT_MIN || !(TotalDays(last - line.End) > 20);
+	}
+
+	// ---- The trades from the chart's intraday data file (spec H.3; NinjaTrader 1.2.0-1.2.3's tick downloads) ----
+
+	// Reads intraday file records by index (Sierra Chart: ReadIntradayFileRecordAtIndex with the file locked for one
+	// call's reads, Session VP's reader; tests: a vector).
+	struct RecordReader
+	{
+		virtual bool Read(int64_t index, s_IntradayRecord& record) = 0;
+
+	protected:
+		~RecordReader() = default;
+	};
+
+	bool SameRecord(const s_IntradayRecord& a, const s_IntradayRecord& b)
+	{
+		return a.DateTime.AsMicrosecondsSinceBaseDate() == b.DateTime.AsMicrosecondsSinceBaseDate() && a.Open == b.Open && a.High == b.High
+			&& a.Low == b.Low && a.Close == b.Close && a.NumTrades == b.NumTrades && a.TotalVolume == b.TotalVolume
+			&& a.BidVolume == b.BidVolume && a.AskVolume == b.AskVolume;
+	}
+
+	// The trades NinjaTrader's tick downloads and live ticks hold, read from the chart's own intraday file: every
+	// record from `From` (CT) on, per CT minute, each traded price's volume. A trade's minute is the one its time falls
+	// in, as Sierra Chart builds its 1-minute bars (NinjaTrader puts a trade stamped exactly on the minute in the minute
+	// before, as it builds its own), so each minute's trades add up to the 1-minute bar beside it. A record of several
+	// trades (data kept coarser than 1 tick: Intraday Data Storage Time Unit above 1 Tick, or older history stored as
+	// 1-second records) is not a trade: its minute is not tick data (Bundled), so that minute, and a session holding it,
+	// use 1-minute bars, as NinjaTrader's do where its download has no ticks.
+	struct TickStore final : TradeSource
+	{
+		std::map<CtTime, PriceVolumes>	Minutes;			// CT minute start -> (price, volume), price ascending
+		std::set<CtTime>				Bundled;			// minutes holding a record of several trades
+		double							Tick		= 0;	// prices snapped to it
+		CtTime							From		= CT_MIN;	// trades from here on are read (CT_MIN: nothing yet)
+		CtTime							FileFrom	= CT_MIN;	// the file's first trade when it starts after From
+		CtTime							Through		= CT_MIN;	// every trade before this time is read
+		bool							Started		= false;	// Next found (the first record at or after From)
+		int64_t							Next		= 0;		// the next record to read
+		bool							HasLast		= false;	// Last: the record at Next - 1, to tell a file read anew
+		s_IntradayRecord				Last;
+		bool							CaughtUp	= false;	// the last read reached the chart's last record
+		int64_t							FailedAt	= -1;		// the record that last failed to read
+		int								Failures	= 0;		// on how many calls in a row
+		int64_t							Skipped		= 0;		// records left out because they never read
+		int64_t							Reads		= 0;		// records read (tests)
+
+		void Reset(CtTime from, double tick)
+		{
+			Minutes.clear();
+			Bundled.clear();
+			Tick		= tick;
+			From		= from;
+			FileFrom	= CT_MIN;
+			Through		= CT_MIN;
+			Started		= false;
+			Next		= 0;
+			HasLast		= false;
+			CaughtUp	= false;
+			FailedAt	= -1;
+			Failures	= 0;
+		}
+
+		// A later load needs less: the minutes before `from` go.
+		void TrimBefore(CtTime from)
+		{
+			if (from <= From)
+				return;
+			Minutes.erase(Minutes.begin(), Minutes.lower_bound(from));
+			Bundled.erase(Bundled.begin(), Bundled.lower_bound(from));
+			From = from;
+		}
+
+		// Reads on to `last` (the chart's last record) while `more()` allows; `toCt`: a record's stored time
+		// (microseconds) -> CT; `now` (CT): the present, before which every trade is in the file once the reading
+		// reaches its end. False when the file was read anew under the store (a download or a reload: its records
+		// moved): the caller resets it.
+		bool Read(RecordReader& reader, int64_t last, const std::function<CtTime(int64_t)>& toCt, CtTime now, const std::function<bool()>& more)
+		{
+			s_IntradayRecord r;
+			if (!Started)
+			{
+				// The first record at or after From (records are in time order).
+				int64_t lo = 0, hi = last + 1;
+				while (lo < hi)
+				{
+					const int64_t mid = lo + (hi - lo) / 2;
+					Reads++;
+					if (reader.Read(mid, r) && toCt(r.DateTime.AsMicrosecondsSinceBaseDate()) < From)
+						lo = mid + 1;
+					else
+						hi = mid;
+				}
+				Next	= lo;
+				Started	= true;
+				HasLast	= false;
+				// The file starts after From: the trades before its first one are not there.
+				FileFrom = Next == 0 && last >= 0 && reader.Read(0, r) ? toCt(r.DateTime.AsMicrosecondsSinceBaseDate()) : CT_MIN;
+			}
+			else if (HasLast && (Next - 1 > last || !reader.Read(Next - 1, r) || !SameRecord(r, Last)))
+				return false;
+			CtTime newest = CT_MIN;
+			int64_t count = 0;
+			while (Next <= last && ((++count & 1023) != 0 || more()))
+			{
+				Reads++;
+				if (!reader.Read(Next, r))
+				{
+					// Tried again on the next calls; after TICKS_READ_TRIES calls in a row it is left out, so one bad record
+					// never stops the reading (and the load waiting for it). Its trade is missing: its minute's trades fall
+					// short of the 1-minute bar and use it (MinuteTradesFor), and a session needs 99% (TickValue).
+					Failures = FailedAt == Next ? Failures + 1 : 1;
+					FailedAt = Next;
+					if (Failures < TICKS_READ_TRIES)
+						break;
+					Next++;
+					Skipped++;
+					HasLast		= false;
+					FailedAt	= -1;
+					Failures	= 0;
+					continue;
+				}
+				Next++;
+				Last	= r;
+				HasLast	= true;
+				if (r.TotalVolume == 0)
+					continue;	// a bid/ask update
+				const CtTime t = toCt(r.DateTime.AsMicrosecondsSinceBaseDate());
+				newest = (std::max)(newest, t);
+				if (t < From)
+					continue;
+				const CtTime minute = FloorDiv(t, 60) * 60;
+				if (r.NumTrades > 1)
+				{
+					Bundled.insert(minute);
+					continue;
+				}
+				const double price = SnapToTick((double)r.Close, Tick);
+				PriceVolumes& prices = Minutes[minute];
+				auto at = std::lower_bound(prices.begin(), prices.end(), price,
+					[](const std::pair<double, double>& x, double p) { return x.first < p; });
+				if (at == prices.end() || at->first != price)
+					at = prices.insert(at, std::make_pair(price, 0.0));
+				at->second += (double)r.TotalVolume;
+			}
+			CaughtUp = Next > last;
+			Through = (std::max)(Through, CaughtUp ? (std::max)(newest, now) : newest);
+			return true;
+		}
+
+		bool Minute(CtTime minute, PriceVolumes& out) const override
+		{
+			out.clear();
+			if (minute < From || minute < FileFrom || Bundled.count(minute) != 0)
+				return false;
+			const auto found = Minutes.find(minute);
+			if (found == Minutes.end())
+				return false;
+			out = found->second;
+			return true;
+		}
+
+		CtTime ReadThrough() const override
+		{
+			return Through;
+		}
+
+		bool Ticks(CtTime from, CtTime to) const override
+		{
+			if (from < From || from < FileFrom)
+				return false;
+			const auto bundled = Bundled.lower_bound(from);
+			return bundled == Bundled.end() || *bundled >= to;
 		}
 	};
 
@@ -5414,6 +7245,9 @@ namespace
 		flag(s.inv_enable); number(s.inv_start_h); number(s.inv_start_minute); number(s.inv_end_h); number(s.inv_end_m); flag(s.inv_alert);
 		text(s.spikeTimeRange); flag(s.spike_alert); flag(s.showSpike); flag(s.spike_show_sup); flag(s.spike_show_res);
 		text(s.tbl_session); text(s.context_session); number(s.daily_atr_length);
+		// 1.2.4: the settings come here moved to the instrument's hours (InstrumentHours::Apply), with the regular hours
+		// and the TPO periods' shift they were moved to.
+		text(s.RthSession); number(s.TpoShift);
 		return h;
 	}
 
@@ -5954,15 +7788,37 @@ namespace
 		uint32_t					RangesKey	= 0;
 		int							TagBar		= -1;
 		// The daily levels (spec B.4.7): NinjaTrader's source of the engine's load, made again with each
-		// engine; the file re-read at most every 5 s while live (wall clock).
+		// engine; the file re-read (the link read, and asked when due) at most every 5 s while live (wall clock).
 		LevelFileSource				Levels;
 		uint64_t					LevelsReadMs	= 0;
 		bool						LevelsRead		= false;
-		std::function<uint64_t()>	NowMs			= []() { return (uint64_t)GetTickCount64(); };	// tests replace it
+		std::function<uint64_t()>	NowMs			= []() { return (uint64_t)GetTickCount64(); };	// tests replace them
+		std::function<int64_t()>	UtcNow			= SystemUtcSeconds;
+		// The levels link's request of this instance, the id of its last HTTP answer (the link's or Discord's), and
+		// the chart's trades: a link asks only when a trade came since the last read (NinjaTrader's charts ask on
+		// their ticks, so a closed market asks nothing).
+		LinkRequester				LinkHttp;
+		int							HttpLastAnswer	= 0;
+		uint64_t					TradeKey		= 0;
+		bool						Traded			= false;
 		// The Discord sender (spec D), made when the switch and a valid URL are set; the setup notice.
 		std::unique_ptr<DiscordSender>	Discord;
 		uint64_t					DiscordKey		= 0;
 		std::string					DiscordSetupWarning;
+		// The trades (NinjaTrader 1.2.0-1.2.3, spec H.3): the chart's intraday file from where the load needs it, its
+		// records' time base (chart time or UTC, found once per reading and again when the chart's time zone changes) and
+		// the UTC -> chart offsets (per UTC hour, for the chart's time zone).
+		TickStore					Ticks;
+		bool						TicksWanted	= false;
+		bool						TicksUsable	= false;
+		bool						TicksUtc	= false;
+		bool						TicksSettled	= true;		// the bars told the time base (else asked at each new bar)
+		size_t						TicksBaseBars	= 0;		// the bar count it was last asked at
+		std::unordered_map<int64_t, int64_t>	UtcOffsets;
+		// The load's wait for the tick file (TicksWait): since when (NowMs), while it lasts.
+		bool						TicksWaiting	= false;
+		uint64_t					TicksWaitSince	= 0;
+		bool TicksBehind() const { return TicksWanted && TicksUsable && !Ticks.CaughtUp; }
 		// Diagnostics (tests, harness).
 		int							Rebuilds	= 0;
 		int							RangeAdds	= 0;
@@ -6055,6 +7911,16 @@ namespace
 			size = list[index];
 	}
 
+	// 1. Global: Use Instrument Hours (NinjaTrader 1.2.4), input 129: a Sierra Chart with 128 inputs has none, and a chartbook
+	// saved with the study's 1.2.3 or older may restore it without its type; both keep NinjaTrader's default, on.
+	bool InstHoursInput(SCStudyInterfaceRef sc)
+	{
+		if (sc.Input.GetArraySize() <= IN_INST_HOURS)
+			return true;
+		SCInputRef in = sc.Input[IN_INST_HOURS];
+		return in.ValueType == YESNO_VALUE ? in.GetYesNo() != 0 : true;
+	}
+
 	Settings ReadSettings(SCStudyInterfaceRef sc)
 	{
 		Settings s;
@@ -6075,6 +7941,7 @@ namespace
 		s.HideAllLabels		= yes(IN_HIDE_ALL_LABELS);
 		s.ShowPriceTags		= yes(IN_SHOW_TAGS);
 		s.tzguard_enable	= yes(IN_TZ_GUARD);
+		s.inst_hours		= InstHoursInput(sc);
 		// 2. Levels. lvl_text: the paste box until the study puts the accepted document there (spec B.4.7).
 		s.lvl_paste			= StringInput(sc, IN_LEVELS_TEXT);
 		s.levels_file		= StringInput(sc, IN_LEVELS_FILE);
@@ -6530,6 +8397,369 @@ namespace
 	}
 
 	// The first date at which two daily histories differ (INT_MAX: none).
+	// sc.ReadIntradayFileRecordAtIndex with the file locked for the reads of one study call (Session VP's reader, Sierra
+	// Chart's own example): the first read takes the lock, the others keep it, the destructor releases it, so the lock
+	// is never held across calls (live data keeps flowing between them).
+	struct SierraReader final : RecordReader
+	{
+		s_sc*	Sc		= nullptr;
+		bool	Locked	= false;
+
+		explicit SierraReader(SCStudyInterfaceRef sc) : Sc(&sc) {}
+		SierraReader(const SierraReader&) = delete;
+		SierraReader& operator=(const SierraReader&) = delete;
+		~SierraReader() { Release(); }
+
+		bool Read(int64_t index, s_IntradayRecord& record) override
+		{
+			if (index < 0 || Sc->ReadIntradayFileRecordAtIndex == nullptr)
+				return false;
+			record = s_IntradayRecord();
+			const int result = Sc->ReadIntradayFileRecordAtIndex(index, record, Locked ? IFLA_NO_CHANGE : IFLA_LOCK_READ_HOLD);
+			Locked = true;
+			// The return value is not documented: a read that filled in nothing failed.
+			return result != 0 || record.DateTime.AsMicrosecondsSinceBaseDate() != 0;
+		}
+
+		void Release()
+		{
+			if (!Locked)
+				return;
+			s_IntradayRecord unused;
+			Sc->ReadIntradayFileRecordAtIndex(-1, unused, IFLA_RELEASE_AFTER_READ);	// -1: no read, only the release
+			Locked = false;
+		}
+	};
+
+	// ---- The records' time base (Session VP's CalibrateRecords, spec H.3) ----
+
+	// The first record index in [first, last + 1] stored at or after t (records are in time order; one that does not
+	// read counts as after).
+	int64_t FirstRecordAtOrAfter(RecordReader& reader, int64_t first, int64_t last, int64_t t)
+	{
+		int64_t lo = first, hi = last + 1;
+		s_IntradayRecord r;
+		while (lo < hi)
+		{
+			const int64_t mid = lo + (hi - lo) / 2;
+			if (reader.Read(mid, r) && r.DateTime.AsMicrosecondsSinceBaseDate() < t)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		return lo;
+	}
+
+	// The records stored in [a, b): indices [Lo, Hi), by two binary searches.
+	struct RecordSpan
+	{
+		int64_t	Lo	= 0;
+		int64_t	Hi	= 0;
+	};
+
+	RecordSpan SpanOf(RecordReader& reader, int64_t last, int64_t a, int64_t b)
+	{
+		RecordSpan span;
+		span.Lo = FirstRecordAtOrAfter(reader, 0, last, a);
+		span.Hi = FirstRecordAtOrAfter(reader, span.Lo, last, b);
+		return span;
+	}
+
+	// How many of a completed bar's open and close the records of its span reproduce: the first and last trade's price.
+	// 0 when no trade is there. A few reads.
+	int PriceEvidence(RecordReader& reader, const RecordSpan& span, const ChartBar& bar, double tick)
+	{
+		int matches = 0;
+		s_IntradayRecord r;
+		for (int64_t k = span.Lo; k < span.Hi && k < span.Lo + 64; k++)
+			if (reader.Read(k, r) && r.TotalVolume > 0)
+			{
+				matches += SnapToTick((double)r.Close, tick) == bar.Open ? 1 : 0;
+				break;
+			}
+		for (int64_t k = span.Hi - 1; k >= span.Lo && k > span.Hi - 1 - 64; k--)
+			if (reader.Read(k, r) && r.TotalVolume > 0)
+			{
+				matches += SnapToTick((double)r.Close, tick) == bar.Close ? 1 : 0;
+				break;
+			}
+		return matches;
+	}
+
+	// 1 when the records of a completed bar's span add up to its volume. Not tried past EVIDENCE_MAX_RECORDS records (0).
+	int VolumeEvidence(RecordReader& reader, const RecordSpan& span, const ChartBar& bar)
+	{
+		if (!(span.Hi > span.Lo && span.Hi - span.Lo <= EVIDENCE_MAX_RECORDS))
+			return 0;
+		double volume = 0;
+		s_IntradayRecord r;
+		for (int64_t k = span.Lo; k < span.Hi; k++)
+			if (reader.Read(k, r))
+				volume += (double)r.TotalVolume;
+		return volume == bar.Volume ? 1 : 0;
+	}
+
+	// The completed bars that can tell the two time bases apart: holding trades, at a time when the chart's time zone is
+	// not at UTC+0, newest first. When it is at UTC+0 now (London in winter), the newest bars before that (one change in
+	// the loaded bars assumed). `chartToUtc`: chart time -> UTC (microseconds).
+	std::vector<int> EvidenceBars(const std::vector<ChartBar>& bars, const std::function<int64_t(int64_t)>& chartToUtc)
+	{
+		std::vector<int> out;
+		const int lastDone = (int)bars.size() - 2;	// the last bar may still be forming
+		if (lastDone < 0)
+			return out;
+		auto offset = [&bars, &chartToUtc](int i) { return chartToUtc(bars[(size_t)i].Su) != bars[(size_t)i].Su; };
+		int from = lastDone;
+		if (!offset(from))
+		{
+			if (!offset(0))
+				return out;		// UTC+0 over the whole chart: both time bases read the same times
+			int lo = 0, hi = lastDone;	// offset at lo, none at hi
+			while (hi - lo > 1)
+			{
+				const int mid = lo + (hi - lo) / 2;
+				(offset(mid) ? lo : hi) = mid;
+			}
+			from = lo;
+		}
+		for (int i = from; i >= 0 && from - i < 256 && (int)out.size() < EVIDENCE_BARS; i--)
+		{
+			const ChartBar& b = bars[(size_t)i];
+			if (b.Eu > b.Su && !b.Empty && b.Volume > 0 && offset(i))
+				out.push_back(i);
+		}
+		return out;
+	}
+
+	// The records' time base (Session VP's CalibrateRecords): the newest trade at or before the chart's last record falls
+	// in one of the chart's last 4 bars holding trades as it is stored (chart time: 0) or converted from UTC (1); -1:
+	// neither (the tick data does not match the chart's bars). When it fits both ways (bars longer than the zone's offset
+	// from UTC, as 20 and 30 minutes one hour from UTC, or a chart at UTC+0), completed bars decide: under the right time
+	// base the records inside a bar's time span start at its open and end at its close; when that cannot tell (a flat
+	// market), they add up to its volume (bars of up to EVIDENCE_MAX_RECORDS records). Equal evidence, or none (a chart at
+	// UTC+0 over all its bars, where both read the same times), means chart time, and `settled` is false: the caller asks
+	// again when a bar can tell. The reads: a few dozen per evidence bar and time base, at most EVIDENCE_MAX_RECORDS more on
+	// a tie. `utcToChart` and `chartToUtc`: the chart's conversions (microseconds), empty when Sierra Chart has none.
+	int TickTimeBase(RecordReader& reader, int64_t last, const std::vector<ChartBar>& bars, double tick, const std::function<int64_t(int64_t)>& utcToChart,
+		const std::function<int64_t(int64_t)>& chartToUtc, bool& settled)
+	{
+		settled = true;
+		s_IntradayRecord r;
+		int64_t t = 0;
+		bool found = false;
+		for (int64_t i = last; i >= 0 && i > last - 256 && !found; i--)
+			if (reader.Read(i, r) && r.TotalVolume > 0)
+			{
+				t		= r.DateTime.AsMicrosecondsSinceBaseDate();
+				found	= true;
+			}
+		if (!found)
+			return -1;
+		auto fits = [&bars](int64_t x)
+		{
+			int seen = 0;
+			for (size_t i = bars.size(); i-- > 0 && seen < 4;)
+				if (!bars[i].Empty)
+				{
+					if (x >= bars[i].Su && x < bars[i].Eu)
+						return true;
+					seen++;
+				}
+			return false;
+		};
+		const bool asIs = fits(t), fromUtc = utcToChart && fits(utcToChart(t));
+		if (asIs != fromUtc)
+			return asIs ? 0 : 1;
+		if (!asIs)
+			return -1;
+		const std::vector<int> evidence = chartToUtc ? EvidenceBars(bars, chartToUtc) : std::vector<int>();
+		std::vector<RecordSpan> asIsSpans, fromUtcSpans;
+		int chart = 0, utc = 0;
+		for (int i : evidence)
+		{
+			const ChartBar& b = bars[(size_t)i];
+			asIsSpans.push_back(SpanOf(reader, last, b.Su, b.Eu));
+			fromUtcSpans.push_back(SpanOf(reader, last, chartToUtc(b.Su), chartToUtc(b.Eu)));
+			chart	+= PriceEvidence(reader, asIsSpans.back(), b, tick);
+			utc		+= PriceEvidence(reader, fromUtcSpans.back(), b, tick);
+		}
+		if (chart == utc)
+			for (size_t k = 0; k < evidence.size(); k++)
+			{
+				chart	+= VolumeEvidence(reader, asIsSpans[k], bars[(size_t)evidence[k]]);
+				utc		+= VolumeEvidence(reader, fromUtcSpans[k], bars[(size_t)evidence[k]]);
+			}
+		settled = chart != utc;
+		return utc > chart ? 1 : 0;
+	}
+
+	// Inputs 127 and 128 were spare before the study's 1.2.2 (its 1.0.0 and 1.1.0 left them unset). A chartbook saved
+	// then may hold their empty values, and whether Sierra Chart restores them over SetDefaults' after an update is
+	// unknown (Sierra Chart check M47). An input without the type SetDefaults gives it was never set by the user, so it
+	// keeps NinjaTrader's default; one restored as a typed 0 or No can't be told apart (the README's upgrade note).
+
+	// 4. Prev Value: Value From Ticks (Sessions) (NinjaTrader 1.2.0), input 127.
+	int PdTickSessionsInput(SCStudyInterfaceRef sc)
+	{
+		SCInputRef in = sc.Input[IN_PD_TICK_SESSIONS];
+		return in.ValueType == INT_VALUE ? (std::max)(0, in.GetInt()) : 5;
+	}
+
+	// 11. Profile: Profile From Ticks (NinjaTrader 1.2.2), input 128: a Sierra Chart with 128 inputs has none and keeps
+	// NinjaTrader's default, on.
+	bool ProfileTicksInput(SCStudyInterfaceRef sc)
+	{
+		if (sc.Input.GetArraySize() <= IN_PROFILE_TICKS)
+			return true;
+		SCInputRef in = sc.Input[IN_PROFILE_TICKS];
+		return in.ValueType == YESNO_VALUE ? in.GetYesNo() != 0 : true;
+	}
+
+	// The trades (spec H.3): on a rebuild, from where the load needs them (AmtCore::TicksFrom: NinjaTrader's tick
+	// downloads); then on to the chart's last record (the replay's position in a replay), at most about 100 ms per call
+	// (sc.UpdateAlways calls again until it is in). True when the engine must be built again: the file was read anew
+	// under the store (a download or a reload moved its records), or its trades became readable after the engine was
+	// built without them (the first trades, or a time base found or changed). `minutes`: the 1-minute bars the load has
+	// (the period NinjaTrader 1.2.3 asks for is the Session Time window that began last with trading in it).
+	bool ReadTicks(SCStudyInterfaceRef sc, StudyState& st, bool rebuild, CtTime now, double tick, const MinuteSource* minutes)
+	{
+		TickStore& store = st.Ticks;
+		if (rebuild)
+		{
+			const CtTime from = st.Core.TicksFrom(now, minutes, &st.Clock);
+			st.TicksWanted = from != CT_MIN;
+			if (!st.TicksWanted)
+			{
+				store.Reset(CT_MIN, tick);
+				st.TicksUsable = false;
+				return false;
+			}
+			if (!st.TicksUsable || !store.Started || store.From > from || store.Tick != tick)
+			{
+				store.Reset(from, tick);
+				st.TicksUsable = false;
+			}
+			else
+				store.TrimBefore(from);
+		}
+		if (!st.TicksWanted)
+			return false;
+		const int64_t last = sc.FileRecordIndexOfLastDataRecordInChart;
+		SierraReader reader(sc);
+		auto utcToChart = [&sc, &st](int64_t utc)
+		{
+			const int64_t hour = FloorDiv(utc, US_PER_HOUR);
+			auto found = st.UtcOffsets.find(hour);
+			if (found == st.UtcOffsets.end())
+			{
+				const int64_t start = hour * US_PER_HOUR;
+				const int64_t chart = sc.ConvertDateTimeUTCToChartTimeZone != nullptr
+					? Micros(sc.ConvertDateTimeUTCToChartTimeZone(SCDateTime::MICROSECONDS(start))) : start;
+				found = st.UtcOffsets.emplace(hour, chart - start).first;
+			}
+			return utc + found->second;
+		};
+		std::function<int64_t(int64_t)> toChart, toUtc;
+		if (sc.ConvertDateTimeUTCToChartTimeZone != nullptr)
+		{
+			toChart	= utcToChart;
+			toUtc	= [&sc](int64_t chart) { return Micros(sc.ConvertDateTimeFromChartTimeZone(SCDateTime::MICROSECONDS(chart), TIMEZONE_UTC)); };
+		}
+		bool found = false;
+		if (!st.TicksUsable)
+		{
+			if (last < 0)
+			{
+				// No records yet: nothing to read; the minutes use 1-minute bars until trades come.
+				store.CaughtUp	= true;
+				store.Through	= (std::max)(store.Through, now);
+				return false;
+			}
+			bool settled = true;
+			const int base = TickTimeBase(reader, last, st.Bars, tick, toChart, toUtc, settled);
+			if (base < 0)
+			{
+				int& logged = sc.GetPersistentInt(PI_TICKS_LOGGED);
+				if ((logged & 1) == 0)
+					sc.AddMessageToLog(TEXT_TICKS_TIME_LOG, 0);
+				logged |= 1;
+				return false;
+			}
+			st.TicksUtc			= base == 1;
+			st.TicksUsable		= true;
+			st.TicksSettled		= settled;
+			st.TicksBaseBars	= st.Bars.size();
+			found				= !rebuild;
+		}
+		else if (!st.TicksSettled && st.Bars.size() != st.TicksBaseBars && last >= 0)
+		{
+			// A time base the bars could not tell (a chart at UTC+0 so far, where both read the same times) is asked again
+			// at each new bar: once the zone's offset changes (daylight saving), its bars decide, and a change of time base
+			// reads the file anew and builds the engine again.
+			bool settled = true;
+			const int base = TickTimeBase(reader, last, st.Bars, tick, toChart, toUtc, settled);
+			st.TicksBaseBars = st.Bars.size();
+			if (base >= 0 && settled)
+			{
+				st.TicksSettled = true;
+				if ((base == 1) != st.TicksUtc)
+				{
+					st.TicksUtc = base == 1;
+					store.Reset(store.From, tick);
+					found = true;
+				}
+			}
+		}
+		const CtClock& clock = st.Clock;
+		const bool utc = st.TicksUtc;
+		const std::function<CtTime(int64_t)> toCt = [&clock, utc, &utcToChart](int64_t stored) { return clock.Of(utc ? utcToChart(stored) : stored); };
+		const uint64_t started = st.NowMs();
+		const std::function<bool()> more = [&st, started]() { return st.NowMs() - started < 100; };
+		bool anew = false;
+		if (!store.Read(reader, last, toCt, now, more))
+		{
+			store.Reset(store.From, tick);
+			store.Read(reader, last, toCt, now, more);
+			anew = true;
+		}
+		int& logged = sc.GetPersistentInt(PI_TICKS_LOGGED);
+		if ((!store.Bundled.empty() || sc.IntradayDataStorageTimeUnit != 0) && (logged & 2) == 0)
+		{
+			sc.AddMessageToLog(TEXT_TICKS_STORAGE_LOG, 0);
+			logged |= 2;
+		}
+		if (store.Skipped > 0 && (logged & 8) == 0)
+		{
+			sc.AddMessageToLog(TEXT_TICKS_UNREADABLE_LOG, 0);
+			logged |= 8;
+		}
+		return anew || found;
+	}
+
+	// Whether the load still waits for the tick file (the loading text). NinjaTrader's load waits for its downloads at most
+	// 60 s for the sessions (tickWaitUntil) and 120 s for the current profile's period (periodWaitUntil), then goes on
+	// with 1-minute bars where they are not in. Here the file is read in time order, the sessions before the period, so
+	// the wait from its first call is limited once: 120 s when the period's trades are asked for, else 60 s. Past it the
+	// engine is built from what has been read; the reading goes on, the rest use 1-minute bars until read (TickValue,
+	// MinuteTradesFor), and a session read later refreshes the pd value live (PatchPrevDay), as NinjaTrader's late
+	// downloads do.
+	bool TicksWait(SCStudyInterfaceRef sc, StudyState& st)
+	{
+		const uint64_t now = st.NowMs();
+		if (!st.TicksWaiting)
+		{
+			st.TicksWaiting		= true;
+			st.TicksWaitSince	= now;
+		}
+		if (now - st.TicksWaitSince < (st.Core.AsksPeriod() ? TICKS_WAIT_PERIOD_MS : TICKS_WAIT_SESSIONS_MS))
+			return true;
+		int& logged = sc.GetPersistentInt(PI_TICKS_LOGGED);
+		if ((logged & 4) == 0)
+			sc.AddMessageToLog(TEXT_TICKS_WAIT_LOG, 0);
+		logged |= 4;
+		return false;
+	}
+
 	int FirstDailyDifference(const DailyHistory& a, const DailyHistory& b)
 	{
 		const size_t n = (std::min)(a.Data.size(), b.Data.size());
@@ -6872,6 +9102,35 @@ namespace
 		return "Tatanka AMT Toolkit: " + message;
 	}
 
+	// What Use Instrument Hours does on this symbol (Sierra Chart only: the root is read from the symbol, so the message
+	// log says which root and hours it found): a root whose hours aren't ES's, on or off; with it on, a root it doesn't
+	// know (off, nothing would move for it either way). Empty on ES's hours.
+	std::string InstrumentHoursText(const std::string& symbol, bool on)
+	{
+		const std::string root = RootOf(symbol);
+		const InstrumentHours::Hours h = InstrumentHours::Of(root);
+		auto clock = [](int m) { char t[8]; snprintf(t, sizeof(t), "%02d:%02d", m / 60, m % 60); return std::string(t); };
+		if (!InstrumentHours::Listed(root))
+			return on ? "Use Instrument Hours: " + symbol + " (root " + root + ") is not a market it knows, so the session fields run as typed, on "
+				"ES's regular hours (08:30-15:00 CT)." : std::string();
+		if (h.Open == InstrumentHours::EsOpen && h.Close == InstrumentHours::EsClose)
+			return std::string();
+		const std::string hours = clock(h.Open) + "-" + clock(h.Close) + " CT";
+		return on ? "Use Instrument Hours: " + symbol + " is " + root + ", regular hours " + hours + ". The session fields run at those hours."
+			: "Use Instrument Hours is off: " + symbol + " is " + root + " (regular hours " + hours + "), and the session fields run as typed, on "
+				"ES's regular hours (08:30-15:00 CT).";
+	}
+
+	void LogInstrumentHours(SCStudyInterfaceRef sc, const std::string& symbol, bool on)
+	{
+		const std::string text = InstrumentHoursText(symbol, on);
+		int& logged = sc.GetPersistentInt(PI_HOURS_LOGGED);
+		const int key = text.empty() ? 0 : (int)(Fnv1a(2166136261u, text.data(), text.size()) | 1u);
+		if (key != 0 && key != logged)
+			sc.AddMessageToLog(LogText(text).c_str(), 0);
+		logged = key;
+	}
+
 	void ProcessCall(SCStudyInterfaceRef sc, StudyState& st)
 	{
 		AmtCore& core = st.Core;
@@ -6893,6 +9152,9 @@ namespace
 			st.ClockZone = zoneName;
 			st.Bars.clear();
 			st.Built = false;
+			// The records' UTC -> chart offsets and their time base were the old zone's: found again, the file read anew.
+			st.UtcOffsets.clear();
+			st.TicksUsable = false;
 		}
 
 		// This chart's bars (all of them on a full recalculation).
@@ -6901,6 +9163,15 @@ namespace
 		const int from = fullRead ? 0 : (std::max)(0, (std::min)(sc.UpdateStartIndex, (int)st.Bars.size() - 1));
 		const bool barsChanged = ReadBars(sc, st, from, tick);
 		st.SecondsPerBar = sc.SecondsPerBar;
+		// A trade since the last call: the last bar's count, volume and close, or the latest trade's time, moved.
+		if (n > 0)
+		{
+			uint64_t trade = Fnv1a64(FNV64_BASIS, &n, sizeof(n));
+			const double last[3] = {(double)sc.Volume[n - 1], (double)sc.Close[n - 1], sc.LatestDateTimeForLastBar.GetAsDouble()};
+			trade = Fnv1a64(trade, last, sizeof(last));
+			st.Traded = st.Traded || trade != st.TradeKey;
+			st.TradeKey = trade;
+		}
 
 		// The minute source (spec C.2.2): this chart on a 1-minute chart of whole minutes, else the
 		// hidden 1-minute chart.
@@ -6965,10 +9236,14 @@ namespace
 			}
 		}
 
+		// The trades' two settings (NinjaTrader's PdTickSessions and ProfileTicks properties, 1.2.0 and 1.2.2).
+		core.PdTickSessions	= PdTickSessionsInput(sc);
+		core.ProfileTicks	= ProfileTicksInput(sc);
+
 		// The engine key (spec C.4).
 		uint64_t key = SettingsKey(core.Cfg);
 		const int64_t numbers[] = {kind, chart, sc.SecondsPerBar, sc.StartTime1, sc.EndTime1, sc.StartTime2, sc.EndTime2, sc.UseSecondStartEndTimes,
-			sc.NewBarAtSessionStart, dailyChart};
+			sc.NewBarAtSessionStart, dailyChart, core.PdTickSessions, core.ProfileTicks ? 1 : 0};
 		key = Fnv1a64(key, numbers, sizeof(numbers));
 		key = Fnv1a64(key, &tick, sizeof(tick));
 		key = Fnv1a64Text(Fnv1a64Text(key, symbol), zoneName);
@@ -6994,6 +9269,17 @@ namespace
 			if (!MinutesCover(minutes->At(minutes->Count() - 1).M, NewestTrade(st.Bars, latest), sc.IsReplayRunning() != 0))
 				waiting = true;
 		}
+		// The trades (spec H.3; NinjaTrader 1.2.0-1.2.3's tick downloads): read before the engine is built, for as long as
+		// NinjaTrader's load waits for its downloads at most (TicksWait), then as they come. The present (the replay's time
+		// in a replay) picks the sessions, as NinjaTrader's clock does.
+		const CtTime nowCt = st.Clock.Of(Micros(sc.GetCurrentDateTime()));
+		if (!waiting)
+		{
+			if (ReadTicks(sc, st, rebuild || !st.Built, nowCt, tick, minutes))
+				rebuild = true;
+			if ((rebuild || !st.Built) && st.TicksBehind())
+				waiting = TicksWait(sc, st);
+		}
 		if (waiting)
 		{
 			if (rebuild)
@@ -7013,10 +9299,20 @@ namespace
 			const SCDateTime chart = sc.ConvertDateTimeUTCToChartTimeZone != nullptr ? sc.ConvertDateTimeUTCToChartTimeZone(utc) : utc;
 			return st.Clock.Of(Micros(chart));
 		};
+		// A chart that had no levels at load reads its link's answer when it comes; levels it brings build the engine
+		// again from them (NinjaTrader waits up to 3 s for that answer at load and builds the engine with it).
+		if (!rebuild && st.Levels.LoadAnswered())
+		{
+			st.Levels.AwaitingLink = false;
+			st.Levels.ReferencePrice = st.Bars.empty() ? NaN : st.Bars.back().Close;
+			if (st.Levels.Refresh(false))
+				rebuild = true;
+		}
 		if (rebuild)
 		{
 			core.Reset();
 			st.Built		= true;
+			st.TicksWaiting	= false;
 			st.EngineKey	= key;
 			st.HashedCount	= 0;
 			st.MinuteHash	= FNV64_BASIS;
@@ -7034,9 +9330,16 @@ namespace
 			const std::function<CtTime(int64_t)> toCt = st.Levels.ToCt;
 			st.Levels = LevelFileSource();
 			st.Levels.ToCt = toCt;
+			st.Levels.NowMs = [&st]() { return (int64_t)st.NowMs(); };
+			st.Levels.UtcNow = [&st]() { return st.UtcNow(); };
 			st.Levels.ReferencePrice = reference;
 			st.Levels.Initialize(core.Cfg.levels_file, MathEx::LevelsRoot(RootOf(symbol)), core.Cfg.lvl_paste, cacheDirectory);
 			st.LevelsRead = false;
+			// NinjaTrader's load asks for the tick history (State.DataLoaded): the sessions and the period, answered from the
+			// file read above.
+			core.Trades = st.TicksUsable ? &st.Ticks : nullptr;
+			core.RequestTickDays(nowCt);
+			core.RequestPeriodTicks(nowCt, minutes, &st.Clock);
 		}
 		core.Cfg.lvl_text = st.Levels.Current.Serialize();
 		st.HiddenReady	= kind == SRC_HIDDEN && minutes != nullptr;
@@ -7078,8 +9381,9 @@ namespace
 			if (st.Discord && !replay)
 				st.Discord->Enqueue("[" + symbol + "] " + text + " | " + CtStamp(st.Clock.Of(Micros(sc.LatestDateTimeForLastBar))) + " CT");
 		};
-		// The levels file while live, at most every 5 s, after this call's commits and before the preview
-		// (NinjaTrader's ReadLevelsFile, NT:1900-1912): a new revision replaces the engine's levels.
+		// The levels file or link while live, at most every 5 s, after this call's commits and before the preview
+		// (NinjaTrader's ReadLevelsFile, NT:1900-1912): a new revision replaces the engine's levels. A link asks
+		// only if a trade came since the last read.
 		const bool live = in.Live;
 		in.BeforePreview = [&st, &core, live]()
 		{
@@ -7091,7 +9395,9 @@ namespace
 			st.LevelsRead	= true;
 			st.LevelsReadMs	= now;
 			st.Levels.ReferencePrice = st.Bars.empty() ? NaN : st.Bars.back().Close;
-			if (st.Levels.Refresh())
+			const bool ask = st.Traded;
+			st.Traded = false;
+			if (st.Levels.Refresh(ask))
 				core.ReplaceLevels(st.Levels.Current);
 		};
 		core.Run(in);
@@ -7839,11 +10145,10 @@ namespace
 		for (const FrameProfile& h : f.Profiles)
 			if (h.Current)
 				DrawCurrentProfile(sc, v, h);
-		// The archive as NinjaTrader keeps it for the rolling pd lines shown now.
-		const int shownPd = PdCombination(Visible(sc.Subgraph[SG_PD_HIGH]), Visible(sc.Subgraph[SG_PD_LOW]), Visible(sc.Subgraph[SG_PD_OPEN]));
-		for (const ArchivedLine& a : core.History)
-			if (a.In(shownPd))
-				RenderLine(sc, v, a.Line, true);
+		// The archive as NinjaTrader keeps it for the lines shown now: each line kept by its own start (1.2.2).
+		for (const LineItem& line : core.History)
+			if (ArchiveShows(core, cfg, line))
+				RenderLine(sc, v, line, true);
 		std::vector<const LineItem*> order;
 		for (const LineItem& line : f.Lines)
 			if (!IsTopLayer(cfg, line))
@@ -8589,14 +10894,60 @@ namespace
 			st.DiscordSetupWarning = "Discord disabled: " + error;
 	}
 
-	// One pump of the Discord sender per study call: its response, its timeout, its next post.
-	void PumpDiscord(SCStudyInterfaceRef sc, StudyState& st)
+	// The computer's clock in CT (NinjaTrader's TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, central)): UTC -> the
+	// chart's time zone -> CT, by Sierra Chart's conversions.
+	CtTime CtNow(SCStudyInterfaceRef sc, const StudyState& st)
+	{
+		const SCDateTime utc = SCDateTime::MICROSECONDS(st.UtcNow() * US_PER_SECOND);
+		const SCDateTime chart = sc.ConvertDateTimeUTCToChartTimeZone != nullptr ? sc.ConvertDateTimeUTCToChartTimeZone(utc) : utc;
+		return FloorDiv(sc.ConvertDateTimeFromChartTimeZone(chart, TIMEZONE_CHICAGO).AsMicrosecondsSinceBaseDate(), US_PER_SECOND);
+	}
+
+	// Sierra Chart's answer this call (sc.HTTPRequestID, sc.HTTPResponse): Discord's when it is its open request's (or a
+	// late one it gave up on), the levels link's when it is the link's (LinkRequester::Answer), else Discord's unless
+	// it is the id of this instance's previous answer (left over on a later call). Returns the id Discord's sender
+	// gets (0: none).
+	int RouteHttp(SCStudyInterfaceRef sc, StudyState& st)
+	{
+		const int id = sc.HTTPRequestID;
+		if (id == 0)
+			return 0;
+		const int last = st.HttpLastAnswer;
+		st.HttpLastAnswer = id;
+		if (st.Discord && (id == st.Discord->Pending() || st.Discord->GaveUpOn(id)))
+			return id;
+		if (st.LinkHttp.Answer(id, std::string(sc.HTTPResponse.GetChars()), last, CtNow(sc, st), (int64_t)st.NowMs()))
+			return 0;
+		return id == last ? 0 : id;
+	}
+
+	// The levels link's request (LinkRequester): its timeouts, then a request (sc.MakeHTTPRequest) when the link is
+	// due and Discord has no request open. `start` false (the configuration-error path): nothing new is asked.
+	void PumpLink(SCStudyInterfaceRef sc, StudyState& st, bool start)
+	{
+		const bool free = start && !(st.Discord && st.Discord->Pending() != 0);
+		st.LinkHttp.Pump(start ? st.Levels.Link : std::shared_ptr<LevelLink>(), free, CtNow(sc, st), (int64_t)st.NowMs(), [&sc](const std::string& url)
+		{
+			return sc.MakeHTTPRequest != nullptr ? sc.MakeHTTPRequest(url.c_str()) : 0;
+		});
+	}
+
+	// One pump of the Discord sender per study call: its response (RouteHttp's id), its timeout, its next post (none
+	// while the levels link has this instance's request open).
+	void PumpDiscord(SCStudyInterfaceRef sc, StudyState& st, int responseId)
 	{
 		if (!st.Discord)
 			return;
 		SierraHttp http;
 		http.Sc = &sc;
-		st.Discord->Pump(st.NowMs(), sc.HTTPRequestID, sc.HTTPRequestID != 0 ? std::string(sc.HTTPResponse.GetChars()) : std::string(), http);
+		st.Discord->Hold = st.LinkHttp.Open();
+		st.Discord->Pump(st.NowMs(), responseId, responseId != 0 ? std::string(sc.HTTPResponse.GetChars()) : std::string(), http);
+	}
+
+	// Called again at the chart update interval while a levels link request is open, due, or awaited at load.
+	bool LinkBusy(StudyState& st)
+	{
+		return st.LinkHttp.Open() || st.Levels.AwaitingLink || (st.Levels.Link && st.Levels.Link->Due((int64_t)st.NowMs()));
 	}
 
 	// ---- Defaults (spec A.2, A.3, C.1) ----
@@ -8619,11 +10970,31 @@ namespace
 		g.SecondaryColorUsed = 0;
 	}
 
+	// The order the Study Settings window lists the inputs in. Input numbers are final, so inputs 127-129 came after the
+	// Discord inputs; Sierra Chart's DisplayOrder puts each in its group where NinjaTrader orders it: Use Instrument Hours
+	// after Warn if Session Times Were Changed (NinjaTrader's Order 8 after 7), Value From Ticks (Sessions) after RTH
+	// Session for VA (53 after 52), Profile From Ticks after Calc Precision (158, as Calc Precision, then by name).
+	std::vector<int> InputDisplayOrder()
+	{
+		std::vector<int> order;
+		for (int i = 0; i < IN_PD_TICK_SESSIONS; i++)
+		{
+			order.push_back(i);
+			if (i == IN_TZ_GUARD)
+				order.push_back(IN_INST_HOURS);
+			else if (i == IN_CC_SESSION)
+				order.push_back(IN_PD_TICK_SESSIONS);
+			else if (i == IN_MVP_CALC_PRECISION)
+				order.push_back(IN_PROFILE_TICKS);
+		}
+		return order;
+	}
+
 	void SetDefaults(SCStudyInterfaceRef sc)
 	{
 		sc.GraphName		= "Tatanka AMT Toolkit";
 		sc.GraphShortName	= "Tatanka AMT";
-		sc.StudyDescription	= "Tatanka AMT Toolkit v1.0.0: a complete Auction Market Theory read on one chart. Value, balance vs trend, trapped inventory, "
+		sc.StudyDescription	= "Tatanka AMT Toolkit v1.2.4: a complete Auction Market Theory read on one chart. Value, balance vs trend, trapped inventory, "
 							  "unfinished business and reference prices. Free and open source (MPL 2.0). tatankatrading.com";
 		sc.AutoLoop			= 0;
 		sc.GraphRegion		= 0;
@@ -8759,10 +11130,11 @@ namespace
 			"your local timezone silently shifts every level. To see times on your own clock, change the chart's time zone (Chart Settings) - not these "
 			"fields. This warning prints on the chart if any session field no longer matches its exchange-time default.");
 		// 2. Levels (Stage 4)
-		sc.Input[IN_LEVELS_FILE].Name = "2. Levels: Levels File (full path; supports {root})";
+		sc.Input[IN_LEVELS_FILE].Name = "2. Levels: Levels File or Link (supports {root})";
 		sc.Input[IN_LEVELS_FILE].SetPathAndFileName("");
-		sc.Input[IN_LEVELS_FILE].SetDescription("Read daily prices from a local text file. Leave blank to use Paste levels here. {root} becomes the "
-			"chart's root symbol; micros use the parent (MES reads ES, MNQ reads NQ, MCL reads CL, MGC reads GC). This does not connect to Discord.");
+		sc.Input[IN_LEVELS_FILE].SetDescription("Paste your levels link from /connect in the Tatanka Discord: each publish then loads by itself. Or enter "
+			"the full path of a local levels file. Leave blank to use Paste levels here. {root} becomes the chart's root symbol; micros use the parent "
+			"(MES reads ES, MNQ reads NQ, MCL reads CL, MGC reads GC). This never connects to Discord.");
 		text(IN_LEVELS_TEXT, "2. Levels: Paste Levels Here", "",
 			"Paste daily prices here when Levels file is blank. Accepts the one-line Discord paste line (2026-09-30, pivot, resistance..., "
 			"support...) or the three-line Pivot Level / Resistance Levels / Support Levels block. If both are pasted, the paste line wins. No Discord "
@@ -8772,9 +11144,9 @@ namespace
 		number(IN_LVL_FLIP_ATR, "2. Levels: Flip ATR Buffer", 0.05, -1e9, 1e9, "Price must pass the level by this many ATRs to flip.");
 		yesNo(IN_LVL_SHOW_ZONES, "2. Levels: Show Zones", 1, "Draws a shaded zone above and below each level.");
 		choice(IN_LVL_ZONE_MODE, "2. Levels: Zone Size Mode", "ATR %;Ticks", 0,
-			"ATR % sizes the zone as a percentage of the 14-day ATR. Ticks uses a fixed number of ticks.");
+			"ATR % sizes the zone as a percentage of the daily ATR (17. Dashboard: Daily ATR Period). Ticks uses a fixed number of ticks.");
 		number(IN_LVL_ZONE_ATR_PCT, "2. Levels: Zone Width (ATR %)", 0.02, 0.01, 0.50,
-			"Zone extends this percentage of the 14-day ATR above and below each level. 0.05 = 5%.");
+			"Zone extends this percentage of the daily ATR above and below each level. 0.05 = 5%.");
 		integer(IN_LVL_ZONE_TICKS, "2. Levels: Zone Width (ticks above & below)", 8, 1, 200, "Only used when Zone Size Mode is set to Ticks.");
 		integer(IN_LVL_ZONE_TRANSP, "2. Levels: Zone Transparency (0=solid, 100=clear)", 85, 0, 100);
 		choice(IN_LVL_LABELS, "2. Levels: Show Labels / Label Size", "auto;tiny;small;normal;large;huge;Off", 4, "Off hides the level labels.");
@@ -8808,7 +11180,7 @@ namespace
 		yesNo(IN_CC_ALERT_80, "4. Prev Value: Alert 80% Rule Confirmed", 1,
 			"Fire alert when the 80% Rule setup is confirmed (price held inside value area for 60 minutes).");
 		// 5. OVN (Stage 2; the session also feeds the dashboard's SESSION row)
-		yesNo(IN_OVN_ENABLE, "5. OVN: Enable OVN High/Low", 1, "Tracks the High and Low of the Globex session (5pm - 8:30am).");
+		yesNo(IN_OVN_ENABLE, "5. OVN: Enable OVN High/Low", 1, "Tracks the High and Low of the Globex session (5pm to the RTH open, 8:30am on ES).");
 		text(IN_OVN_SESSION, "5. OVN: OVN Session Time (CT)", "1700-0830:123456");
 		text(IN_OVN_DELETE, "5. OVN: Delete OVN Lines At (CT)", "1500-1505", "Time to remove OVN lines from the chart to clean up.");
 		choice(IN_OVN_LABELS, "5. OVN: Show Labels / Label Size", LABELS_4, 2);
@@ -8889,7 +11261,7 @@ namespace
 		// 14. nPOC (Stage 3)
 		yesNo(IN_NPOC_ENABLE, "14. nPOC: Enable nPOCs", 1, "Tracks untouched POCs from previous days/weeks/months.");
 		number(IN_NPOC_BIN, "14. nPOC: Manual Bin Size (0 = Auto)", 0, 0, 1e9,
-			"0 = Auto: POC bin = base tick times the row scale. Otherwise your bin size (times the row scale).");
+			"0 = Auto: naked POCs from the volume profile's rows, so each sits on its profile's POC. Otherwise your bin size (times the row scale).");
 		choice(IN_NPOC_LABELS, "14. nPOC: Show Labels / Label Size", LABELS_5, 1);
 		integer(IN_NPOC_LABEL_OFFSET, "14. nPOC: Label Offset", 2, -50, 200);
 		yesNo(IN_NPOC_ALERT, "14. nPOC: Alert nPOC Touch", 1);
@@ -8914,7 +11286,7 @@ namespace
 			"Sets when the dashboard's RTH rows are live and where ATR USED starts.");
 		text(IN_CONTEXT_SESSION, "17. Dashboard: Context Tracking Session (CT)", "0815-1500", "Used for background calculations (highs/lows/ATR).");
 		integer(IN_ATR_PERIOD, "17. Dashboard: Daily ATR Period", 14, 1, 1000,
-			"Daily ATR Period feeds the dashboard, the Normal Day test and the pivot band; zones and flips always use a 14-day ATR.");
+			"Daily ATR Period feeds the dashboard, the Normal Day test, the pivot band and the level zones and flips.");
 		// 18. Alerts
 		yesNo(IN_CAP_ENABLE, "18. Alerts: Enable Alert Storm Cap", 1,
 			"Soft cap on total alerts within a rolling window to prevent webhook flooding. When the cap is hit, one warning alert fires and further "
@@ -8938,6 +11310,28 @@ namespace
 			"In Discord: Server Settings > Integrations > Create Webhook. Choose the receiving channel and copy its Webhook URL here. A server invite "
 			"or channel link will not work. Configure mobile notifications in Discord. Sierra Chart saves this URL in the chartbook in plain text: "
 			"don't share a chartbook that holds it, and recreate the webhook if it leaks.");
+		// 4. Prev Value (NinjaTrader 1.2.0) and 11. Profile (1.2.2): numbered after the others, as input numbers are final, and
+		// listed in their groups (InputDisplayOrder).
+		integer(IN_PD_TICK_SESSIONS, "4. Prev Value: Value From Ticks (Sessions)", 5, 0, 20,
+			"pdPOC, pdVAH and pdVAL from every trade at one-tick rows (as a tick volume profile) for this many recent RTH sessions, read from the "
+			"chart's tick data as the chart loads and at each close; older days from 1-minute bars. Needs Intraday Data Storage Time Unit 1 Tick. "
+			"0: 1-minute bars only (before v1.2.0).");
+		if (sc.Input.GetArraySize() > IN_PROFILE_TICKS)
+			yesNo(IN_PROFILE_TICKS, "11. Profile: Profile From Ticks", 1,
+				"The current Session or Weekly profile and its Developing POC, VAH and VAL from every trade, read from the chart's tick data from the "
+				"period's start as the chart loads, then as trades come. Monthly and Yearly profiles, older periods and any minute whose trades are "
+				"missing use 1-minute bars. Needs Intraday Data Storage Time Unit 1 Tick. Off: 1-minute bars only (before v1.2.2).");
+		// 1. Global (NinjaTrader 1.2.4): numbered last, listed after Warn if Session Times Were Changed (InputDisplayOrder).
+		if (sc.Input.GetArraySize() > IN_INST_HOURS)
+			yesNo(IN_INST_HOURS, "1. Global: Use Instrument Hours", 1,
+				"Session fields are written for ES's regular hours (08:30-15:00 CT). On another market they move to its own (GC 07:20-12:30, CL "
+				"08:00-13:30): a time nearer the open moves with the open, one nearer the close with the close. Off: every field as typed on every "
+				"market.");
+		// Every input this Sierra Chart has gets its place, numbered from 1 as Sierra Chart's own studies number theirs.
+		uint16_t place = 0;
+		for (const int i : InputDisplayOrder())
+			if (i < sc.Input.GetArraySize())
+				sc.Input[i].DisplayOrder = ++place;
 	}
 
 	// Sierra Chart's Session Times in CT hold both 03:00 and 12:00 (the full Globex session).
@@ -8965,8 +11359,9 @@ SCSFExport scsf_TatankaAmtToolkit(SCStudyInterfaceRef sc)
 	if (sc.LastCallToFunction)
 	{
 		// The study is removed (or the chart closed): the levels editor closes (its edits are dropped), the
-		// two menu items, the ranges, the Discord queue and the heap state go. The hidden charts stay:
-		// other charts and studies of the symbol read them.
+		// two menu items, the ranges, the Discord queue and the heap state go; a levels link request still open
+		// is freed for another chart that reads the link. The hidden charts stay: other charts and studies of the
+		// symbol read them.
 		PollEditor(sc, PP_EDITOR, IN_LEVELS_TEXT, true);
 		int& editMenuId		= sc.GetPersistentInt(PI_EDIT_MENU_ID);
 		int& pasteMenuId	= sc.GetPersistentInt(PI_PASTE_MENU_ID);
@@ -8995,6 +11390,14 @@ SCSFExport scsf_TatankaAmtToolkit(SCStudyInterfaceRef sc)
 	std::string warning;
 	std::string error = ValidateSettings(state.Core.Cfg, warning);
 	state.SettingsWarning = warning;
+	// The session fields at the instrument's own hours (Use Instrument Hours, NinjaTrader 1.2.4): the engine, the trades
+	// read and the profile's period all run on these; the warning above checked them as typed.
+	if (error.empty())
+	{
+		const std::string symbol = sc.Symbol.GetChars();
+		state.Core.Cfg = InstrumentHours::Apply(state.Core.Cfg, RootOf(symbol));
+		LogInstrumentHours(sc, symbol, state.Core.Cfg.inst_hours);
+	}
 	if (error.empty())
 	{
 		n_ACSIL::s_BarPeriod period;
@@ -9016,17 +11419,21 @@ SCSFExport scsf_TatankaAmtToolkit(SCStudyInterfaceRef sc)
 	state.Error = error;
 	// The Discord switch and URL (a change drops the old sender).
 	UpdateDiscord(sc, state);
+	// This call's HTTP answer: the levels link's is handed to its feed now; Discord's goes to its sender below.
+	const int discordAnswer = RouteHttp(sc, state);
 
 	if (!error.empty())
 	{
 		// Only the fault text is drawn. Once the cause is gone the engine is built again. Discord messages
-		// already queued still go (NinjaTrader's sender runs on after a fault).
+		// already queued still go (NinjaTrader's sender runs on after a fault); the levels link asks nothing new.
 		state.Core.Reset();
 		state.Built = false;
+		state.TicksWaiting = false;		// a load after the fault waits afresh
 		DeleteRanges(sc, state);
 		WriteTags(sc, state, true);
-		PumpDiscord(sc, state);
-		sc.UpdateAlways = EditorOpen(sc) || (state.Discord && state.Discord->Busy()) ? 1 : 0;
+		PumpDiscord(sc, state, discordAnswer);
+		PumpLink(sc, state, false);
+		sc.UpdateAlways = EditorOpen(sc) || (state.Discord && state.Discord->Busy()) || state.LinkHttp.Open() ? 1 : 0;
 		return;
 	}
 
@@ -9034,9 +11441,13 @@ SCSFExport scsf_TatankaAmtToolkit(SCStudyInterfaceRef sc)
 	ProcessCall(sc, state);
 	WriteTags(sc, state, sc.IsFullRecalculation != 0 || state.Rebuilds != rebuilds || state.Waiting);
 	UpdateRanges(sc, state);
-	PumpDiscord(sc, state);
-	// Sierra Chart calls again at the chart update interval while the data is not there yet, while the
-	// editor is open (its saved text is picked up) and while Discord messages are queued or in flight.
-	sc.UpdateAlways = state.Waiting || EditorOpen(sc) || (state.Discord && state.Discord->Busy()) ? 1 : 0;
+	// Discord first (an alert can't wait; the link asks on a schedule of 15 s and more), then the link if Discord left
+	// the request slot free.
+	PumpDiscord(sc, state, discordAnswer);
+	PumpLink(sc, state, true);
+	// Sierra Chart calls again at the chart update interval while the data is not there yet (the tick file too), while the
+	// editor is open (its saved text is picked up), while Discord messages are queued or in flight and while
+	// a levels link request is due, open or awaited at load.
+	sc.UpdateAlways = state.Waiting || state.TicksBehind() || EditorOpen(sc) || (state.Discord && state.Discord->Busy()) || LinkBusy(state) ? 1 : 0;
 }
 

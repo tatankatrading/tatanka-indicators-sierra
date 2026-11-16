@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tatanka Trading LLC.
 // This Source Code Form is subject to the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, obtain one at https://mozilla.org/MPL/2.0/.
-// Tatanka TPO Profile v1.0.0 for Sierra Chart - tatankatrading.com
+// Tatanka TPO Profile v1.1.0 for Sierra Chart - tatankatrading.com
 // Sierra Chart port of the NinjaTrader 8 / Pine v6 "TPO Profile".
 //
 // TPO (Market Profile) letters for each block of a session, with the POC, the value area
@@ -13,6 +13,17 @@
 // Sierra bars are stamped at their START, NinjaTrader's at their end, so a bar is classified
 // by its end: its start plus the bar length (or where the data or the Session Times cut it),
 // in the Timezone input's zone, daylight saving included.
+//
+// Use Instrument Hours (NinjaTrader v1.1.0, on by default): the Session Start and End Times are
+// written for ES's regular hours (08:30-15:00 CT) and move to the chart market's own hours, by the
+// root read from the chart's symbol as the AMT Toolkit port reads it (CQG's and IQFeed's forms
+// included). NinjaTrader's Session Time is in its chart time zone and moves at each bar's offset
+// from Central time; here the session times are in the Timezone input's zone, so they move at each
+// bar's offset between that zone and Chicago time: on America/Chicago (the default) 08:30-15:00
+// runs 07:20-12:30 on GC, on America/New_York 09:30-16:00 runs 08:20-13:30, and on UTC or
+// Europe/London each bar moves at its own offset, so the session follows Chicago's daylight saving.
+// Chart Time Zone does what NinjaTrader does in that zone. Off, as typed. A symbol whose market
+// the hours table doesn't list (BTCZ26) gets a note in the Message Log (Sierra Chart only).
 //
 // The live bar is recalculated on every tick: the engine state before the last bar is kept
 // as a checkpoint, restored, and the bar processed again with its current prices, so the
@@ -73,7 +84,9 @@ namespace
 		IN_SHOW_LIVE,
 		IN_SHOW_VA,
 		IN_VA_COLOR,
-		IN_EXTEND_POC
+		IN_EXTEND_POC,
+		IN_USE_HOURS,		// added in 1.1.0 at the end, so saved charts keep their inputs (shown after Timezone)
+		IN_COUNT
 	};
 
 	// The Timezone input, in its list order.
@@ -83,6 +96,7 @@ namespace
 	// Persistent variable keys
 	const int PP_STATE			= 1;
 	const int PI_DAILY_CHART	= 1;
+	const int PI_HOURS_NOTE		= 2;	// NoteUnlistedRoot's symbol
 
 	const int64_t DAY_MS		= 86400000;
 	const int64_t NO_KEY		= INT64_MIN;
@@ -184,6 +198,232 @@ namespace
 			return true;
 		return hasPrevious && open == previousClose && high == previousClose && low == previousClose && close == previousClose;
 	}
+
+	// ---- Use Instrument Hours (NinjaTrader v1.1.0) ----
+	// BEGIN INSTRUMENT HOURS. This block is the same in TatankaTpoProfile.cpp, TatankaSessionVolumeProfile.cpp
+	// and TatankaGapAnalysis.cpp, so the three studies read the same root and move to the same hours. Each
+	// DLL builds on its own, so each file keeps its own copy.
+
+	// The root from Sierra Chart's symbol (Sierra Chart has no root field): Upper, WithoutContract,
+	// ListedRoot, AliasRoot and RootOf are TatankaAmtToolkit.cpp 1.2.4's, word for word (the tests compare
+	// them with that file), so the AMT Toolkit and these studies read the same market from a symbol and
+	// run the same hours on it.
+
+	std::string Upper(const std::string& text)
+	{
+		std::string out = text;
+		for (char& c : out)
+			if (c >= 'a' && c <= 'z')
+				c = (char)(c - 'a' + 'A');
+		return out;
+	}
+
+	// A trailing futures month code and year ([FGHJKMNQUVXZ] + 1-4 digits) removed when something remains (GCZ26 -> GC,
+	// MESZ2026 -> MES, SR3H6 -> SR3).
+	std::string WithoutContract(const std::string& s)
+	{
+		size_t digits = 0;
+		while (digits < s.size() && digits < 4 && s[s.size() - 1 - digits] >= '0' && s[s.size() - 1 - digits] <= '9')
+			digits++;
+		if (digits >= 1 && s.size() >= digits + 2 && strchr("FGHJKMNQUVXZ", s[s.size() - 1 - digits]) != nullptr)
+			return s.substr(0, s.size() - 1 - digits);
+		return s;
+	}
+
+	// Whether the hours table (InstrumentHours, below) lists a root, so RootOf can tell another service's name for one
+	// of them.
+	bool ListedRoot(const std::string& root);
+
+	// NinjaTrader's root for one another data service writes its own way: CQG's names (EP, ENQ, TYA, TNA for the Ultra
+	// 10-Year..., CPE for copper, NQM for E-mini crude, the currencies' EU6... and MX6 for the peso), IQFeed's currencies (EU
+	// for Euro FX, PX for the peso) and the older CME codes some feeds keep (TY, US, FV, TU, EC, BP, JY, AD, CD, SF, NE, MP).
+	// Empty: none.
+	std::string AliasRoot(const std::string& root)
+	{
+		static const std::map<std::string, std::string> aliases = {
+			{"EP", "ES"}, {"ENQ", "NQ"}, {"TYA", "ZN"}, {"USA", "ZB"}, {"FVA", "ZF"}, {"TUA", "ZT"}, {"ULA", "UB"}, {"TNA", "TN"},	// CQG
+			{"CPE", "HG"}, {"NQM", "QM"},
+			{"EU6", "6E"}, {"BP6", "6B"}, {"JY6", "6J"}, {"DA6", "6A"}, {"CA6", "6C"}, {"SF6", "6S"}, {"NE6", "6N"}, {"MX6", "6M"},
+			{"EU", "6E"}, {"PX", "6M"},																			// IQFeed
+			{"TY", "ZN"}, {"US", "ZB"}, {"FV", "ZF"}, {"TU", "ZT"},												// older CME codes
+			{"EC", "6E"}, {"BP", "6B"}, {"JY", "6J"}, {"AD", "6A"}, {"CD", "6C"}, {"SF", "6S"}, {"NE", "6N"}, {"MP", "6M"}};
+		const auto found = aliases.find(root);
+		if (found != aliases.end())
+			return found->second;
+		// CQG's metals and energy end in E (GCE, CLE, SIE, MCLE); IQFeed's start with Q (QGC, QCL, QMGC).
+		if (root.size() >= 3 && root.back() == 'E' && ListedRoot(root.substr(0, root.size() - 1)))
+			return root.substr(0, root.size() - 1);
+		if (root.size() >= 3 && root[0] == 'Q' && ListedRoot(root.substr(1)))
+			return root.substr(1);
+		return std::string();
+	}
+
+	// The instrument root from Sierra Chart's symbol, as NinjaTrader names it (its master instrument name). Upper
+	// case, outer spaces trimmed, then:
+	// - a CQG symbol (F.<country>.<symbol>: F.US.GCEZ26) is read from the part after its second dot;
+	// - a leading @ or / (@ESZ26, /ESZ26) is dropped;
+	// - the symbol is cut at the first _ . - space # : or = (GCZ26_FUT_COMEX, GCZ6.COMEX, GCZ26-COMEX, ES#, CLX26 FUT);
+	// - a root of the hours table, as it stands or without its month code and year, is taken (SR3, GCZ6 -> GC);
+	// - else another service's name for one (AliasRoot: F.US.GCEZ26 -> GCE -> GC, F.US.EPZ26 -> ES, QGCZ26 -> GC, @EUZ26 -> 6E);
+	// - else the symbol without its month code and year (BTCZ26_FUT_CME -> BTC, which keeps ES's hours).
+	std::string RootOf(const std::string& symbol)
+	{
+		std::string s = Upper(symbol);
+		const size_t first = s.find_first_not_of(' ');
+		s = first == std::string::npos ? std::string() : s.substr(first, s.find_last_not_of(' ') - first + 1);
+		if (s.size() > 2 && s[0] == 'F' && s[1] == '.')
+		{
+			const size_t dot = s.find('.', 2);
+			bool letters = dot != std::string::npos && dot > 2 && dot <= 5;
+			for (size_t i = 2; letters && i < dot; i++)
+				letters = s[i] >= 'A' && s[i] <= 'Z';
+			if (letters)
+				s = s.substr(dot + 1);
+		}
+		if (!s.empty() && (s[0] == '@' || s[0] == '/'))
+			s = s.substr(1);
+		const size_t cut = s.find_first_of("_.- #:=");
+		if (cut != std::string::npos)
+			s = s.substr(0, cut);
+		const std::string bare = WithoutContract(s);
+		for (const std::string& candidate : {s, bare})
+		{
+			if (ListedRoot(candidate))
+				return candidate;
+			const std::string alias = AliasRoot(candidate);
+			if (!alias.empty())
+				return alias;
+		}
+		return bare;
+	}
+
+	// A market's regular hours in Chicago time, by root, micros with their parent's: the AMT Toolkit's
+	// table (NinjaTrader v1.2.4), which NinjaTrader's TPO Profile, Session Volume Profile and Gap Analysis
+	// copy. The session times are written for ES's regular hours (08:30-15:00 CT); Use Instrument Hours
+	// moves them to the chart's market. A root not listed has ES's hours: nothing moves.
+	struct InstrumentHours
+	{
+		static constexpr int EsOpen		= 8 * 60 + 30;
+		static constexpr int EsClose	= 15 * 60;
+
+		int	Open	= EsOpen;	// minutes of the day, Chicago time
+		int	Close	= EsClose;
+
+		bool IsEs() const { return Open == EsOpen && Close == EsClose; }
+
+		struct Entry { const char* Root; int Open; int Close; };
+
+		// The table's entry for a root, nullptr if it has none.
+		static const Entry* Find(const std::string& root)
+		{
+			static const Entry table[] =
+			{
+				{"ES", 510, 900}, {"MES", 510, 900}, {"NQ", 510, 900}, {"MNQ", 510, 900}, {"RTY", 510, 900},	// equity index 08:30-15:00
+				{"M2K", 510, 900}, {"YM", 510, 900}, {"MYM", 510, 900}, {"EMD", 510, 900}, {"NKD", 510, 900},
+				{"CL", 480, 810}, {"MCL", 480, 810}, {"QM", 480, 810}, {"NG", 480, 810}, {"RB", 480, 810},		// energy 08:00-13:30
+				{"HO", 480, 810},
+				{"GC", 440, 750}, {"MGC", 440, 750},															// metals 07:20-12:30
+				{"SI", 445, 745}, {"SIL", 445, 745},															// 07:25-12:25
+				{"HG", 430, 720}, {"MHG", 430, 720},															// 07:10-12:00
+				{"PL", 440, 725},																				// 07:20-12:05
+				{"PA", 450, 720},																				// 07:30-12:00
+				{"ZT", 440, 840}, {"ZF", 440, 840}, {"ZN", 440, 840}, {"TN", 440, 840}, {"ZB", 440, 840},		// interest rates 07:20-14:00
+				{"UB", 440, 840}, {"SR3", 440, 840},
+				{"6E", 440, 840}, {"M6E", 440, 840}, {"6B", 440, 840}, {"6J", 440, 840}, {"6A", 440, 840},		// currencies 07:20-14:00
+				{"6C", 440, 840}, {"6S", 440, 840}, {"6N", 440, 840}, {"6M", 440, 840},
+			};
+			for (const Entry& e : table)
+				if (root == e.Root)
+					return &e;
+			return nullptr;
+		}
+
+		static InstrumentHours Of(const std::string& root)
+		{
+			InstrumentHours h;
+			if (const Entry* e = Find(root))
+			{
+				h.Open	= e->Open;
+				h.Close	= e->Close;
+			}
+			return h;
+		}
+
+		// Whether the table lists a root (one with ES's own hours included).
+		static bool Listed(const std::string& root) { return Find(root) != nullptr; }
+
+		static int Mod(int m) { return (m % 1440 + 1440) % 1440; }
+
+		// A CT time (minutes of the day) written for ES's hours, at the same place in this market's
+		// open-close: one nearer the open moves with the open, one nearer the close with the close (a
+		// tie goes with the open); the overnight (before 07:00, from 16:00) stays.
+		int Move(int m) const
+		{
+			if (m < 7 * 60 || m >= 16 * 60)
+				return m;
+			return m + (std::abs(m - EsOpen) <= std::abs(m - EsClose) ? Open - EsOpen : Close - EsClose);
+		}
+
+		// A window's start and end (CT minutes) moved as a whole: each end on its own, unless that
+		// changes the window's order. Two ends either side of 11:45 that would land on the same minute
+		// or past each other (11:00-12:00: 10:30-10:30 on CL, 09:50-09:30 on GC) both move as the
+		// window's middle does, keeping its length (CL 10:30-11:30, GC 09:50-10:50).
+		void MoveWindow(int& a, int& b) const
+		{
+			const int x = Move(a), y = Move(b);
+			if (a == b || ((a < b) == (x < y) && x != y))
+			{
+				a = x;
+				b = y;
+				return;
+			}
+			const int mid = (a + Mod(b - a) / 2) % 1440, d = Move(mid) - mid;
+			a = Mod(a + d);
+			b = Mod(b + d);
+		}
+	};
+
+	bool ListedRoot(const std::string& root)
+	{
+		return InstrumentHours::Listed(root);
+	}
+
+	// Sierra Chart only. A root the table doesn't list (a market NinjaTrader's table leaves out, such as
+	// BTC, or a symbol form RootOf can't read) keeps ES's hours, as on NinjaTrader for a market it
+	// doesn't list. So the setting says so in the Message Log, once per symbol. The note for a symbol:
+	// empty when the table lists its root, or there is no symbol.
+	std::string UnlistedRootNote(const std::string& study, const std::string& symbol)
+	{
+		const std::string root = RootOf(symbol);
+		if (symbol.empty() || InstrumentHours::Listed(root))
+			return std::string();
+		return study + ": Use Instrument Hours does not know the market of " + symbol + " (read as " + root
+			+ "), so the times run as typed, at ES's regular hours. Symbols such as GCZ26_FUT_COMEX, GCZ6.COMEX,"
+			" F.US.GCEZ26 (CQG), QGC# and @GC# (IQFeed) are read. For another market, type its hours and turn the setting"
+			" off.";
+	}
+
+	// Writes the note while the setting is on, once per symbol. noted: a persistent int holding the
+	// hash of the symbol last noted (0: none), so a symbol is noted again after a listed one or after
+	// the setting was off.
+	void NoteUnlistedRoot(SCStudyInterfaceRef sc, const char* study, bool useHours, int& noted)
+	{
+		const std::string symbol	= sc.Symbol.GetChars();
+		const std::string note		= useHours ? UnlistedRootNote(study, symbol) : std::string();
+		if (note.empty())
+		{
+			noted = 0;
+			return;
+		}
+		uint32_t hash = 2166136261u;
+		for (const char ch : symbol)
+			hash = (hash ^ (uint8_t)ch) * 16777619u;
+		const int key = (int)(hash | 1u);
+		if (key != noted)
+			sc.AddMessageToLog(note.c_str(), 0);
+		noted = key;
+	}
+	// END INSTRUMENT HOURS
 
 	// Sierra Chart's Session Times in the chart's time zone: seconds since midnight, each end
 	// the session's last second. The evening session is "Use Evening Session".
@@ -300,6 +540,40 @@ namespace
 		// not on the next bar; NinjaTrader waits for the next bar).
 		bool Completes(int64_t e, int64_t key) const { return e == End(key); }
 	};
+
+	// Use Instrument Hours (NinjaTrader v1.1.0, RunSessionTime): the window typed for ES's hours,
+	// moved to this market's own as a whole (InstrumentHours::MoveWindow) in Chicago time. offset:
+	// the Timezone input's zone minus Chicago time at the bar, in minutes (0 on America/Chicago).
+	// The window is put in Chicago time, moved and put back; the seconds of each end stay.
+	SessionWindow MoveSessionWindow(const SessionWindow& typed, const InstrumentHours& hours, int offset)
+	{
+		int a = InstrumentHours::Mod((int)(typed.StartMs / 60000) - offset);
+		int b = InstrumentHours::Mod((int)(typed.EndMs / 60000) - offset);
+		hours.MoveWindow(a, b);
+		SessionWindow w;
+		w.StartMs	= (int64_t)InstrumentHours::Mod(a + offset) * 60000 + typed.StartMs % 60000;
+		w.EndMs		= (int64_t)InstrumentHours::Mod(b + offset) * 60000 + typed.EndMs % 60000;
+		return w;
+	}
+
+	// A session time as NinjaTrader's label writes it: HHmm, with the seconds when there are any.
+	std::string HhmmText(int64_t ms)
+	{
+		const int seconds = (int)(ms / 1000);
+		char text[16];
+		if (seconds % 60 != 0)
+			snprintf(text, sizeof(text), "%02d%02d%02d", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60);
+		else
+			snprintf(text, sizeof(text), "%02d%02d", seconds / 3600 % 24, seconds / 60 % 60);
+		return text;
+	}
+
+	// NinjaTrader's chart label (DisplayName): the block size and the session the profile runs on
+	// (moved by Use Instrument Hours), or "all" with the filter off.
+	std::string ChartLabel(int blockMinutes, bool filter, const SessionWindow& w)
+	{
+		return "TPO Profile (" + std::to_string(blockMinutes) + "m, " + (filter ? HhmmText(w.StartMs) + "-" + HhmmText(w.EndMs) : std::string("all")) + ")";
+	}
 
 	// The block (letter) of a bar ending at e in a session opening at open, both in ms of one
 	// zone: NinjaTrader's -1 ms puts a bar ending exactly on a block boundary in the block it
@@ -620,6 +894,7 @@ namespace
 		int		Bar			= 0;
 		bool	In			= false;	// in the session window (always, with the filter off)
 		int64_t	Key			= NO_KEY;	// session identity: the window's date, or the trading date
+		int64_t	Open		= 0;		// and its window's open (filter on; NinjaTrader's sessionStartTime)
 		int		Letter		= 0;		// block index
 		bool	Completes	= false;	// the bar ends exactly at the window's end
 		int		AtrDate		= 0;		// trading date, for the daily ATR
@@ -634,14 +909,22 @@ namespace
 		int				Zone			= TZO_CHICAGO;
 		int				BlockMinutes	= 30;
 		RowSizing		Sizing;
+		bool			UseHours		= false;	// Use Instrument Hours on, filter on, a market with its own hours
+		InstrumentHours	Hours;
+
+		// The window a bar runs on (NinjaTrader's SessionAt): the typed one, or moved at the bar's
+		// offset (minutes) between the Timezone input's zone and Chicago time.
+		SessionWindow WindowAt(int offset) const { return UseHours ? MoveSessionWindow(Window, Hours, offset) : Window; }
 	};
 
 	// The engine's view of a bar. zoneEndMs: the bar's end in the Timezone input's zone;
 	// chartEndMs: in the chart's zone; tradingDate/tradingOpenMs: Sierra Chart's trading day of
 	// the bar and its start (chart zone), used with the filter off (NinjaTrader's trading-hours
 	// template sessions, NT:125-129, NT:201-207), where a session ends only when the next starts.
+	// offset: the Timezone input's zone minus Chicago time at the bar's end, in minutes (Use
+	// Instrument Hours).
 	TpoBar MakeBar(int bar, const EngineConfig& c, int64_t zoneEndMs, int64_t chartEndMs, int tradingDate, int64_t tradingOpenMs,
-		int atrDate, double high, double low)
+		int atrDate, double high, double low, int offset = 0)
 	{
 		TpoBar b;
 		b.Bar		= bar;
@@ -650,13 +933,15 @@ namespace
 		b.Low		= low;
 		if (c.Filter)
 		{
+			const SessionWindow window = c.WindowAt(offset);
 			int64_t key = NO_KEY;
-			b.In = c.Window.Classify(zoneEndMs, key);
+			b.In = window.Classify(zoneEndMs, key);
 			if (b.In)
 			{
 				b.Key		= key;
-				b.Letter	= LetterIndex(zoneEndMs, c.Window.Open(key), c.BlockMinutes);
-				b.Completes	= c.Window.Completes(zoneEndMs, key);
+				b.Open		= window.Open(key);
+				b.Letter	= LetterIndex(zoneEndMs, b.Open, c.BlockMinutes);
+				b.Completes	= window.Completes(zoneEndMs, key);
 			}
 		}
 		else
@@ -676,7 +961,9 @@ namespace
 		bool	HasLive			= false;
 		bool	LiveInSession	= false;
 		int64_t	LiveKey			= NO_KEY;
+		int64_t	LiveOpen		= 0;
 		int64_t	CompletedKey	= NO_KEY;
+		int64_t	CompletedOpen	= 0;
 		int		FirstBar		= -1;
 		int		LastBar			= -1;
 		int		AtrDate			= 0;
@@ -696,7 +983,9 @@ namespace
 		bool						HasLive			= false;
 		bool						LiveInSession	= false;	// the last bar was in the live session (Show Developing)
 		int64_t						LiveKey			= NO_KEY;
+		int64_t						LiveOpen		= 0;		// its window's open (filter on)
 		int64_t						CompletedKey	= NO_KEY;	// the session last saved by completion
+		int64_t						CompletedOpen	= 0;
 		int							FirstBar		= -1;
 		int							LastBar			= -1;
 		int							AtrDate			= 0;
@@ -714,10 +1003,12 @@ namespace
 			// the window. Only tick, volume or range bars can end exactly at the window's end
 			// after the bar that completed it (end times at whole seconds); NinjaTrader's
 			// millisecond stamps put such bars after the end, outside the window too.
-			const bool in = bar.In && !(CompletedKey != NO_KEY && bar.Key == CompletedKey);
+			const bool in = bar.In && !(CompletedKey != NO_KEY && bar.Key == CompletedKey && bar.Open == CompletedOpen);
 
-			// A bar outside the window or of another session ends the running one (NT:131-136).
-			if (HasLive && (!in || bar.Key != LiveKey))
+			// A bar outside the window or of another session ends the running one (NT:131-136). A
+			// window moved by Use Instrument Hours at another offset (a daylight-saving change in
+			// the session) opens another session, as NinjaTrader's changed session open does.
+			if (HasLive && (!in || bar.Key != LiveKey || bar.Open != LiveOpen))
 				SaveSession();
 
 			if (in && !HasLive)
@@ -727,6 +1018,7 @@ namespace
 				// that saves it; TradingView draws every profile with the last bar's step).
 				HasLive		= true;
 				LiveKey		= bar.Key;
+				LiveOpen	= bar.Open;
 				FirstBar	= bar.Bar;
 				AtrDate		= bar.AtrDate;
 				Mult		= RowMultiplier(Sizing, atr.ForDate(bar.AtrDate));
@@ -757,7 +1049,8 @@ namespace
 					// for the next bar, so on RTH-only charts a finished day stays "live"
 					// overnight and, with Show Developing off, invisible).
 					SaveSession();
-					CompletedKey = bar.Key;
+					CompletedKey	= bar.Key;
+					CompletedOpen	= bar.Open;
 				}
 			}
 			LiveInSession = HasLive && in;	// NT:145
@@ -803,7 +1096,9 @@ namespace
 			cp.HasLive			= HasLive;
 			cp.LiveInSession	= LiveInSession;
 			cp.LiveKey			= LiveKey;
+			cp.LiveOpen			= LiveOpen;
 			cp.CompletedKey		= CompletedKey;
+			cp.CompletedOpen	= CompletedOpen;
 			cp.FirstBar			= FirstBar;
 			cp.LastBar			= LastBar;
 			cp.AtrDate			= AtrDate;
@@ -823,7 +1118,9 @@ namespace
 			HasLive			= cp.HasLive;
 			LiveInSession	= cp.LiveInSession;
 			LiveKey			= cp.LiveKey;
+			LiveOpen		= cp.LiveOpen;
 			CompletedKey	= cp.CompletedKey;
+			CompletedOpen	= cp.CompletedOpen;
 			FirstBar		= cp.FirstBar;
 			LastBar			= cp.LastBar;
 			AtrDate			= cp.AtrDate;
@@ -1342,6 +1639,11 @@ namespace
 		int				Rebuilds		= 0;	// full engine rebuilds (diagnostics, tests)
 		std::string		Error;					// configuration error for the drawing callback
 
+		// The offset (minutes, Timezone input's zone minus Chicago time) of the last bar processed:
+		// the chart label shows the session that bar runs on (NinjaTrader's sessionTime).
+		bool			HasLabelOffset	= false;
+		int				LabelOffset		= 0;
+
 		// The hidden daily chart (ReadDailyChart): resolved at least once, the symbol it was
 		// requested for, and the symbol it held then.
 		bool			DailyResolved	= false;
@@ -1368,6 +1670,7 @@ namespace
 			Built		= false;
 			LiveShown	= false;
 			LiveProfile	= TpoProfile();
+			HasLabelOffset	= false;
 		}
 	};
 
@@ -1427,6 +1730,9 @@ namespace
 		c.Sizing.Auto			= sc.Input[IN_AUTO_ROWS].GetYesNo() != 0;
 		c.Sizing.TargetRows		= (std::max)(15, (std::min)(100, sc.Input[IN_TARGET_ROWS].GetInt()));
 		c.Sizing.ManualTicks	= (std::max)(1, (std::min)(100, sc.Input[IN_ROW_TICKS].GetInt()));
+		// Use Instrument Hours: the chart market's own hours, by the root read from the symbol.
+		c.Hours					= InstrumentHours::Of(RootOf(sc.Symbol.GetChars()));
+		c.UseHours				= c.Filter && sc.Input[IN_USE_HOURS].GetYesNo() != 0 && !c.Hours.IsEs();
 		return c;
 	}
 
@@ -1527,8 +1833,10 @@ namespace
 	}
 
 	// One chart bar for the engine (spec B.3): its end in the session's zone, its trading day,
-	// tick-snapped high and low.
-	TpoBar BarInput(SCStudyInterfaceRef sc, int index, const EngineConfig& c, const ChartSessions& sessions, bool timeBased, bool endTimes)
+	// tick-snapped high and low. With Use Instrument Hours, the bar's offset between the Timezone
+	// input's zone and Chicago time (offset), at which its session moves.
+	TpoBar BarInput(SCStudyInterfaceRef sc, int index, const EngineConfig& c, const ChartSessions& sessions, bool timeBased, bool endTimes,
+		int& offset)
 	{
 		const SCDateTime start = sc.BaseDateTimeIn[index];
 		const int64_t startMs = start.GetMillisecondsSinceBaseDate();
@@ -1545,10 +1853,18 @@ namespace
 		int64_t zoneEndMs = endMs;
 		int tradingDate = 0;
 		int64_t tradingOpenMs = 0;
+		offset = 0;
 		if (c.Filter)
 		{
 			if (c.Zone != TZO_CHART)
 				zoneEndMs = sc.ConvertDateTimeFromChartTimeZone(SCDateTime::MILLISECONDS(endMs), ZoneOf(c.Zone)).GetMillisecondsSinceBaseDate();
+			// NinjaTrader's SessionAt: the bar's zone time minus its Chicago time (none on Chicago).
+			if (c.UseHours && c.Zone != TZO_CHICAGO)
+			{
+				const int64_t chicagoMs = sc.ConvertDateTimeFromChartTimeZone(SCDateTime::MILLISECONDS(endMs), TIMEZONE_CHICAGO)
+					.GetMillisecondsSinceBaseDate();
+				offset = (int)std::llround((double)(zoneEndMs - chicagoMs) / 60000.0);
+			}
 		}
 		else
 		{
@@ -1557,7 +1873,7 @@ namespace
 		}
 		const int atrDate = c.Filter ? sc.GetTradingDayDate(start) : tradingDate;
 		return MakeBar(index, c, zoneEndMs, endMs, tradingDate, tradingOpenMs, atrDate, SnapToTick(sc.High[index], c.Sizing.Tick),
-			SnapToTick(sc.Low[index], c.Sizing.Tick));
+			SnapToTick(sc.Low[index], c.Sizing.Tick), offset);
 	}
 
 	// Runs the engine over the new bars (spec D.4). A full recalculation, a changed engine
@@ -1573,7 +1889,8 @@ namespace
 		uint32_t key = 2166136261u;
 		const int64_t numbers[] = {c.Filter, c.Window.StartMs, c.Window.EndMs, c.Zone, c.BlockMinutes, c.Sizing.Auto, c.Sizing.TargetRows,
 			c.Sizing.ManualTicks, timeBased, endTimes, sc.SecondsPerBar, sessions.DayStart, sessions.DayEnd, sessions.EveningStart,
-			sessions.EveningEnd, sessions.UseEvening, sessions.NewBarAtSessionStart};
+			sessions.EveningEnd, sessions.UseEvening, sessions.NewBarAtSessionStart, c.UseHours, c.UseHours ? c.Hours.Open : 0,
+			c.UseHours ? c.Hours.Close : 0};
 		key = Fnv1a(key, numbers, sizeof(numbers));
 		key = Fnv1a(key, &c.Sizing.Tick, sizeof(c.Sizing.Tick));
 		if (c.Zone == TZO_CHART)
@@ -1597,6 +1914,7 @@ namespace
 			state.Checkpoint	= TpoCheckpoint();
 			state.InputsKey		= key;
 			state.Built			= true;
+			state.HasLabelOffset	= false;
 			state.Rebuilds++;
 			from				= 0;
 		}
@@ -1618,8 +1936,25 @@ namespace
 				state.Engine.Skip(i);
 				continue;
 			}
-			state.Engine.Update(BarInput(sc, i, c, sessions, timeBased, endTimes), state.Atr);
+			int offset = 0;
+			state.Engine.Update(BarInput(sc, i, c, sessions, timeBased, endTimes, offset), state.Atr);
+			state.HasLabelOffset	= true;
+			state.LabelOffset		= offset;
 		}
+	}
+
+	// NinjaTrader's chart label (DisplayName) in the study's Short Name, rewritten only when it
+	// changes: the session moved by Use Instrument Hours, on America/Chicago at once, in another
+	// zone the last bar's (typed until the first bar).
+	void UpdateLabel(SCStudyInterfaceRef sc, const StudyState& state)
+	{
+		const EngineConfig c = ReadEngineConfig(sc);
+		SessionWindow shown = c.Window;
+		if (c.UseHours && (c.Zone == TZO_CHICAGO || state.HasLabelOffset))
+			shown = c.WindowAt(c.Zone == TZO_CHICAGO ? 0 : state.LabelOffset);
+		const std::string label = ChartLabel(c.BlockMinutes, c.Filter, shown);
+		if (!(sc.GraphShortName == label.c_str()))
+			sc.GraphShortName = label.c_str();
 	}
 
 	DisplaySettings ReadDisplay(SCStudyInterfaceRef sc)
@@ -2360,9 +2695,9 @@ SCSFExport scsf_TatankaTpoProfile(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName		= "Tatanka TPO Profile";
-		sc.StudyDescription	= "Tatanka TPO Profile v1.0.0: TPO (Market Profile) letters for each block of the session with the POC, "
+		sc.StudyDescription	= "Tatanka TPO Profile v1.1.0: TPO (Market Profile) letters for each block of the session with the POC, "
 							  "value area and an open-to-close gradient. Letter detail for recent sessions, outlines for older ones. "
-							  "Free and open source (MPL 2.0). tatankatrading.com";
+							  "Each market uses its own regular hours (Use Instrument Hours). Free and open source (MPL 2.0). tatankatrading.com";
 		sc.GraphRegion		= 0;
 		sc.AutoLoop			= 0;
 		sc.ValueFormat		= VALUEFORMAT_INHERITED;
@@ -2390,6 +2725,12 @@ SCSFExport scsf_TatankaTpoProfile(SCStudyInterfaceRef sc)
 		sc.Input[IN_TIME_ZONE].SetCustomInputStrings("Chart Time Zone;America/Chicago;America/New_York;UTC;Europe/London");
 		sc.Input[IN_TIME_ZONE].SetCustomInputIndex(TZO_CHICAGO);
 		sc.Input[IN_TIME_ZONE].SetDescription("The session times' time zone (daylight saving included). Chart Time Zone = NinjaTrader's behavior.");
+
+		sc.Input[IN_USE_HOURS].Name = "Use Instrument Hours";
+		sc.Input[IN_USE_HOURS].SetYesNo(1);
+		sc.Input[IN_USE_HOURS].SetDescription("The session times are written for ES's regular hours (08:30-15:00 CT), in the Timezone above "
+			"(09:30-16:00 on America/New_York). On another market they move to its own (GC 07:20-12:30 CT, CL 08:00-13:30 CT): a time "
+			"nearer the open moves with the open, one nearer the close with the close. Off: as typed on every market.");
 
 		sc.Input[IN_BLOCK].Name = "Block Size (Minutes)";
 		sc.Input[IN_BLOCK].SetInt(30);
@@ -2464,6 +2805,14 @@ SCSFExport scsf_TatankaTpoProfile(SCStudyInterfaceRef sc)
 		sc.Input[IN_EXTEND_POC].Name = "Extend POC Through Next RTH Session";
 		sc.Input[IN_EXTEND_POC].SetYesNo(0);
 
+		// Shown in NinjaTrader's order: Use Instrument Hours with the session times, after Timezone.
+		for (int i = 0, order = 1; i < IN_USE_HOURS; i++)
+		{
+			sc.Input[i].DisplayOrder = (uint16_t)order++;
+			if (i == IN_TIME_ZONE)
+				sc.Input[IN_USE_HOURS].DisplayOrder = (uint16_t)order++;
+		}
+
 		return;
 	}
 
@@ -2481,6 +2830,11 @@ SCSFExport scsf_TatankaTpoProfile(SCStudyInterfaceRef sc)
 
 	StudyState& state = GetState(sc);
 
+	// Use Instrument Hours moves the session (Filter by Time on): a symbol whose market the table
+	// doesn't list gets a note in the Message Log (Sierra Chart only, NoteUnlistedRoot).
+	NoteUnlistedRoot(sc, "Tatanka TPO Profile", sc.Input[IN_FILTER].GetYesNo() != 0 && sc.Input[IN_USE_HOURS].GetYesNo() != 0,
+		sc.GetPersistentInt(PI_HOURS_NOTE));
+
 	n_ACSIL::s_BarPeriod barPeriod;
 	sc.GetBarPeriodParameters(barPeriod);
 	const bool timeBased = barPeriod.IntradayChartBarPeriodType == IBPT_DAYS_MINS_SECS;
@@ -2492,12 +2846,14 @@ SCSFExport scsf_TatankaTpoProfile(SCStudyInterfaceRef sc)
 		// engine is rebuilt from bar 0.
 		state.ResetEngine();
 		DeleteRanges(sc, state);
+		UpdateLabel(sc, state);
 		return;
 	}
 
 	// Hidden (sc.HideStudy) still processes, so showing the study again draws at once;
 	// UpdateRanges then removes the ranges and the callback draws nothing.
 	ProcessBars(sc, state, timeBased);
+	UpdateLabel(sc, state);
 
 	// The developing profile, built once per call (O(rows)) for the ranges and the callback.
 	const DisplaySettings display = ReadDisplay(sc);

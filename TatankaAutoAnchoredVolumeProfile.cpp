@@ -2254,11 +2254,13 @@ namespace
 				const s_VolumeAtPriceV2* p = nullptr;
 				if (!Vap->GetVAPElementAtIndex((unsigned int)bar, (int)k, &p) || p == nullptr)
 					continue;
+				// Sierra Chart's volume at price volumes are unsigned in older headers and doubles in
+				// newer ones (VAPContainer.h); futures trade whole contracts either way.
 				VapElement e;
 				e.PriceInTicks	= p->PriceInTicks;
-				e.Volume		= p->Volume;
-				e.BidVolume		= p->BidVolume;
-				e.AskVolume		= p->AskVolume;
+				e.Volume		= static_cast<uint32_t>(p->Volume);
+				e.BidVolume		= static_cast<uint32_t>(p->BidVolume);
+				e.AskVolume		= static_cast<uint32_t>(p->AskVolume);
 				out.push_back(e);
 			}
 		}

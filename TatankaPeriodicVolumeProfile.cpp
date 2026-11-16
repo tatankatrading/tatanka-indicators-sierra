@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tatanka Trading LLC.
 // This Source Code Form is subject to the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, obtain one at https://mozilla.org/MPL/2.0/.
-// Tatanka Periodic Volume Profile v1.0.0 for Sierra Chart - tatankatrading.com
+// Tatanka Periodic Volume Profile v1.0.1 for Sierra Chart - tatankatrading.com
 // Sierra Chart port of the NinjaTrader 8 "Periodic Volume Profile" (chart label "Tatanka PVP").
 //
 // Daily, weekly, monthly or yearly volume profiles built from 1-minute bars, with the POC, the
@@ -122,7 +122,7 @@ namespace
 	const int64_t NO_TIME		= INT64_MIN;
 	// |price / tick| beyond this is not a price (NinjaTrader's checked cast would throw, spec A #34).
 	const double MAX_TICK_RATIO	= 4.0e15;
-	// NinjaTrader's row cap (NT:633).
+	// NinjaTrader's row cap (NT:640).
 	const int MAX_ROWS			= 20000;
 	// 1970-01-01 in Sierra Chart's day numbers (days since 1899-12-30).
 	const int SIERRA_UNIX_DATE	= 25569;
@@ -194,7 +194,7 @@ namespace
 		return x - f >= 0.5 ? f + 1 : f;
 	}
 
-	// .NET's Math.Round(x, MidpointRounding.AwayFromZero), NinjaTrader's price to tick (NT:573):
+	// .NET's Math.Round(x, MidpointRounding.AwayFromZero), NinjaTrader's price to tick (NT:580):
 	// 2.5 -> 3, -2.5 -> -3.
 	double RoundHalfAway(double x)
 	{
@@ -202,7 +202,7 @@ namespace
 	}
 
 	// .NET Framework's Math.Max(double, double): the first when larger or NaN, else the second.
-	// NinjaTrader's integration clamps with it (NT:654-655) and keeps MaxAbsDelta (NT:696).
+	// NinjaTrader's integration clamps with it (NT:661-662) and keeps MaxAbsDelta (NT:703).
 	double MaxNet(double a, double b)
 	{
 		if (a > b)
@@ -238,7 +238,7 @@ namespace
 	}
 
 	// The tick index of a price, NinjaTrader's checked((long)Math.Round(price / tickSize,
-	// AwayFromZero)) (NT:573). False for a price that is not a number or out of range.
+	// AwayFromZero)) (NT:580). False for a price that is not a number or out of range.
 	bool TickIndexOf(double price, double tick, int64_t& index)
 	{
 		if (!(tick > 0))
@@ -593,7 +593,7 @@ namespace
 		int64_t	High	= 0;
 		double	Volume	= 0;
 		bool	Up		= true;
-		bool	Valid	= false;	// NinjaTrader would take it (NT:570-574)
+		bool	Valid	= false;	// NinjaTrader would take it (NT:577-581)
 		bool	Empty	= false;	// an empty column of the source: not a minute at all
 
 		bool operator==(const PvpMinute& o) const
@@ -603,7 +603,7 @@ namespace
 		bool operator!=(const PvpMinute& o) const { return !(*this == o); }
 	};
 
-	// A minute from Sierra Chart's float prices. Valid as NinjaTrader's Upsert checks it (NT:570-572):
+	// A minute from Sierra Chart's float prices. Valid as NinjaTrader's Upsert checks it (NT:577-579):
 	// a finite volume >= 0, finite prices and High >= Low; plus the tick conversion (NinjaTrader's
 	// checked cast would throw instead, spec A #34). Up = T(Close) >= T(Open) (spec A #23): equal to
 	// NinjaTrader's Close >= Open on grid prices, immune to float storage.
@@ -625,7 +625,7 @@ namespace
 		return r;
 	}
 
-	// ---- Profile math (spec B.7, NinjaTrader's TatankaPvpCore.Profile, NT:497-720) ----
+	// ---- Profile math (spec B.7, NinjaTrader's TatankaPvpCore.Profile, NT:497-727) ----
 
 	// One display row (NT:497-502): ticks LowTick..HighTick, up and down volume.
 	struct PvpRow
@@ -668,7 +668,7 @@ namespace
 		}
 	};
 
-	// A difference-array entry (NinjaTrader's Density, NT:524-527).
+	// A difference-array entry (NinjaTrader's Density, NT:531-534).
 	struct PvpEvent
 	{
 		double Up	= 0;
@@ -687,7 +687,7 @@ namespace
 		bool operator==(const PvpRange& o) const { return Low == o.Low && High == o.High && Volume == o.Volume && Up == o.Up; }
 	};
 
-	// The settings a profile is built with (NT:558-566).
+	// The settings a profile is built with (NT:565-573).
 	struct PvpProfileConfig
 	{
 		double	Tick	= 0.25;
@@ -701,7 +701,7 @@ namespace
 	// spec A #26: its floating tie-breaks included).
 	struct PvpMath
 	{
-		// NT:669-676: the integer ticks per row whose row count is nearest the target; a tie
+		// NT:676-683: the integer ticks per row whose row count is nearest the target; a tie
 		// picks the thinner rows.
 		static int64_t ChooseTicksPerRow(int64_t span, int target)
 		{
@@ -712,7 +712,7 @@ namespace
 			return smallerError <= largerError ? smaller : larger;
 		}
 
-		// NT:678-685: rescales the rows so their sums are the exact minute volumes.
+		// NT:685-692: rescales the rows so their sums are the exact minute volumes.
 		static void Normalize(std::vector<PvpRow>& rows, double expectedUp, double expectedDown)
 		{
 			double up = 0, down = 0;
@@ -730,7 +730,7 @@ namespace
 			}
 		}
 
-		// NT:687-720 over every row, empty ones included (spec A #27): the POC scan with the
+		// NT:694-727 over every row, empty ones included (spec A #27): the POC scan with the
 		// nearest-the-middle tie rule, the one-row value-area walk (exhausted sides -1, the
 		// 1e-12 x Total tolerance, TradingViewStyle's final break), and the level prices with
 		// NinjaTrader's integer (lower-middle) POC tick.
@@ -786,7 +786,7 @@ namespace
 		}
 	};
 
-	// One period's profile (NinjaTrader's Profile, NT:538-667): finished minutes in a difference
+	// One period's profile (NinjaTrader's Profile, NT:545-674): finished minutes in a difference
 	// map, the newest minute pending (replaced while it forms, committed when a later one arrives),
 	// the snapshot built from both, and the touch state of its levels (spec B.7).
 	struct PvpProfile
@@ -808,7 +808,7 @@ namespace
 		{
 		}
 
-		// NT:568-592 with sourceIndex = the unit's id (a minute's start). Closed profiles and
+		// NT:575-599 with sourceIndex = the unit's id (a minute's start). Closed profiles and
 		// older units take nothing; the same unit again unchanged changes nothing (no version);
 		// a later unit commits the pending one first. Returns whether the profile changed. A
 		// unit given again with only a later time is a change: a volume-at-price bar that ends
@@ -833,7 +833,7 @@ namespace
 				}
 			}
 			// Replacing the forming unit prevents double counting as its cumulative volume, range
-			// and direction change; completed units stay as they were committed (NT:586-587).
+			// and direction change; completed units stay as they were committed (NT:593-594).
 			HasPending	= true;
 			PendingId	= id;
 			PendingRanges.assign(ranges, ranges + count);
@@ -863,7 +863,7 @@ namespace
 			return Upsert(m.M, &r, 1, m.M + US_PER_MINUTE);
 		}
 
-		// NT:594-600: the final snapshot (the pending unit included), then closed for good.
+		// NT:601-607: the final snapshot (the pending unit included), then closed for good.
 		void Complete()
 		{
 			if (Closed)
@@ -894,7 +894,7 @@ namespace
 
 		size_t EventCount() const { return Committed.size(); }
 
-		// NT:617-667. The event values are the committed ones with the pending unit's added in
+		// NT:624-674. The event values are the committed ones with the pending unit's added in
 		// its order (NinjaTrader copies the map, then AddRange's into the copy), so a key holds
 		// committed + share, exactly as after the unit is committed.
 		PvpSnapshot Build() const
@@ -967,7 +967,7 @@ namespace
 				rows[(size_t)i].HighTick	= (std::min)(high, rowLow + ticks - 1);
 			}
 			// Integrate constant-density spans over the rows: the cost follows the event keys and
-			// the rows, not the ticks of a year's range (NT:644-645).
+			// the rows, not the ticks of a year's range (NT:651-652).
 			double runningUp = 0, runningDown = 0;
 			for (size_t i = 0; i + 1 < keys.size(); i++)
 			{
@@ -1015,7 +1015,7 @@ namespace
 			return true;
 		}
 
-		// NT:602-615: +density at Low, -density at High + 1, in the unit's channel. Nothing for
+		// NT:609-622: +density at Low, -density at High + 1, in the unit's channel. Nothing for
 		// a volume of 0 or less.
 		static void AddRange(std::map<int64_t, PvpEvent>& map, const PvpRange& r)
 		{
@@ -1139,7 +1139,7 @@ namespace
 		}
 	};
 
-	// ---- Touches (spec B.7, NinjaTrader's ObserveTouches and Touches.Observe, NT:180-190, NT:513-522) ----
+	// ---- Touches (spec B.7, NinjaTrader's ObserveTouches and Touches.Observe/Holds, NT:180-190, NT:513-529) ----
 
 	// Per closed retained profile, the first chart bar (ascending, empty columns skipped) that
 	// ends after the profile's last minute (E_j > LastChart, NinjaTrader's close stamp) and whose
@@ -1147,6 +1147,12 @@ namespace
 	// call with its current range, and a touch on it is kept (its range only grows). The touches
 	// of all three levels are kept whatever the Extend switches say (they only choose which are
 	// drawn). The developing profile is never tested (NT:187).
+	// The range holds the level when LowTick <= level tick <= HighTick: a bar whose high or low is
+	// exactly the level's price touches it. NinjaTrader 1.0.1 (Touches.Holds) compares the prices
+	// with a margin of 1e-9 of the level for the same result: its level is a tick count times the
+	// tick size (26001 x 0.1 = 2600.1000000000004 on GC) and the bar's high 2600.1, which 1.0.0's
+	// exact comparison missed. Both prices here are on the tick grid (SnapToTick), and the margin is
+	// far below a tick, so comparing tick indices is NinjaTrader 1.0.1's test.
 	// This is NinjaTrader in real time. Its reloaded history (without Tick Replay) takes a minute
 	// at the minute's end, so on bars shorter than a minute (second, tick, volume, range bars) the
 	// ones ending inside the next period's first minute are never tested there: a line can stop at
@@ -2222,11 +2228,13 @@ namespace
 				const s_VolumeAtPriceV2* p = nullptr;
 				if (!Vap->GetVAPElementAtIndex((unsigned int)bar, (int)k, &p) || p == nullptr)
 					continue;
+				// s_VolumeAtPriceV2's volumes are unsigned int in older Sierra Chart headers and double in
+				// newer ones (whole contracts either way): the casts build cleanly with both.
 				VapElement e;
 				e.PriceInTicks	= p->PriceInTicks;
-				e.Volume		= p->Volume;
-				e.BidVolume		= p->BidVolume;
-				e.AskVolume		= p->AskVolume;
+				e.Volume		= static_cast<uint32_t>(p->Volume);
+				e.BidVolume		= static_cast<uint32_t>(p->BidVolume);
+				e.AskVolume		= static_cast<uint32_t>(p->AskVolume);
 				out.push_back(e);
 			}
 		}
@@ -3240,7 +3248,7 @@ SCSFExport scsf_TatankaPeriodicVolumeProfile(SCStudyInterfaceRef sc)
 	{
 		sc.GraphName		= "Tatanka Periodic Volume Profile";
 		sc.GraphShortName	= "";
-		sc.StudyDescription	= "Tatanka Periodic Volume Profile v1.0.0: daily, weekly, monthly or yearly volume profiles from 1-minute bars, "
+		sc.StudyDescription	= "Tatanka Periodic Volume Profile v1.0.1: daily, weekly, monthly or yearly volume profiles from 1-minute bars, "
 							  "with POC, value area and extensions until touched. Defaults: 1 Week, Total, 68% value, 200 rows, 60% width, "
 							  "Left. Uses the chart's own bars on a 1-minute chart, otherwise a hidden 1-minute chart of the same symbol. "
 							  "Free and open source (MPL 2.0). tatankatrading.com";
